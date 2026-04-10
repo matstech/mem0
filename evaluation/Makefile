@@ -12,6 +12,12 @@ run-mem0-plus-add:
 run-mem0-plus-search:
 	python run_experiments.py --technique_type mem0 --method search --is_graph --output_folder results/ --top_k 30
 
+run-mem0-local-add:
+	python run_experiments.py --technique_type mem0_local --method add --output_folder results/
+
+run-mem0-local-search:
+	python run_experiments.py --technique_type mem0_local --method search --output_folder results/ --top_k 30
+
 run-rag:
 	python run_experiments.py --technique_type rag --chunk_size 500 --num_chunks 1 --output_folder results/
 
@@ -29,3 +35,6 @@ run-zep-search:
 
 run-openai:
 	python run_experiments.py --technique_type openai --output_folder results/
+
+run-dmf:
+	python run_experiments.py --technique_type dmf --output_folder results/

@@ -6,8 +6,14 @@ import numpy as np
 from openai import OpenAI
 
 from mem0.memory.utils import extract_json
+from src.runtime_config import apply_runtime_env, load_runtime_config
 
-client = OpenAI()
+try:
+    apply_runtime_env(load_runtime_config())
+except Exception:
+    pass
+
+client = OpenAI(api_key=None if not __import__("os").getenv("OPENAI_API_KEY") else __import__("os").getenv("OPENAI_API_KEY"))
 
 ACCURACY_PROMPT = """
 Your task is to label an answer to a question as ’CORRECT’ or ’WRONG’. You will be given the following data:
