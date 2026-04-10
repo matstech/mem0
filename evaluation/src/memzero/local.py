@@ -4,6 +4,7 @@ import os
 import time
 from collections import defaultdict
 from copy import deepcopy
+from datetime import datetime
 from pathlib import Path
 
 from jinja2 import Template
@@ -231,6 +232,10 @@ def _speaker_usage_path(output_root, conversation_idx, speaker_label):
     return Path(output_root) / str(conversation_idx) / speaker_label / "llm_usage.json"
 
 
+def _speaker_store_path(output_root, conversation_idx, speaker_label):
+    return Path(output_root) / str(conversation_idx) / speaker_label
+
+
 def _write_usage_summary(output_root, conversation_idx, speaker_label, usage_summary):
     usage_path = _speaker_usage_path(output_root, conversation_idx, speaker_label)
     usage_path.parent.mkdir(parents=True, exist_ok=True)
@@ -247,6 +252,13 @@ def _read_usage_summary(output_root, conversation_idx, speaker_label):
             "internal_llm_calls": 0,
         }
     return json.loads(usage_path.read_text(encoding="utf-8"))
+
+
+def _parse_session_datetime(value):
+    try:
+        return datetime.strptime(str(value), "%I:%M %p on %d %B, %Y")
+    except (TypeError, ValueError):
+        return None
 
 
 class MemoryLocalAdd:
@@ -315,6 +327,24 @@ class MemoryLocalAdd:
                 raise ValueError(f"Unknown speaker: {chat['speaker']}")
         return messages, messages_reverse
 
+    def _iter_sessions(self, conversation):
+        sessions = []
+        for key, value in conversation.items():
+            if key in {"speaker_a", "speaker_b"} or key.endswith("_date_time") or "timestamp" in key:
+                continue
+            date_time_key = f"{key}_date_time"
+            timestamp = conversation.get(date_time_key)
+            sessions.append(
+                (
+                    _parse_session_datetime(timestamp) or datetime.max,
+                    key,
+                    timestamp,
+                    value,
+                )
+            )
+        for _, key, timestamp, chats in sorted(sessions, key=lambda item: (item[0], item[1])):
+            yield key, timestamp, chats
+
     def process_conversation(self, item, idx):
         conversation = item["conversation"]
         speaker_a = conversation["speaker_a"]
@@ -325,13 +355,7 @@ class MemoryLocalAdd:
         memory_a = self._speaker_runtime(idx, "speaker_a")
         memory_b = self._speaker_runtime(idx, "speaker_b")
 
-        for key in conversation.keys():
-            if key in ["speaker_a", "speaker_b"] or "date" in key or "timestamp" in key:
-                continue
-
-            date_time_key = key + "_date_time"
-            timestamp = conversation[date_time_key]
-            chats = conversation[key]
+        for _, timestamp, chats in self._iter_sessions(conversation):
             messages, messages_reverse = self._build_speaker_messages(chats, speaker_a, speaker_b)
             memory_a.add(messages, user_id=speaker_a_user_id, metadata={"timestamp": timestamp})
             memory_b.add(messages_reverse, user_id=speaker_b_user_id, metadata={"timestamp": timestamp})
@@ -399,6 +423,28 @@ class MemoryLocalSearch:
             return len(text.split())
         return len(self.tokenizer.encode(text))
 
+    def _validate_conversation_runtime(self, conversation_idx):
+        required_labels = ("speaker_a", "speaker_b")
+        missing_paths = []
+        missing_usage = []
+        for label in required_labels:
+            store_path = _speaker_store_path(self.output_root, conversation_idx, label)
+            usage_path = _speaker_usage_path(self.output_root, conversation_idx, label)
+            if not store_path.exists():
+                missing_paths.append(store_path.as_posix())
+            if not usage_path.exists():
+                missing_usage.append(usage_path.as_posix())
+        if missing_paths or missing_usage:
+            problems = []
+            if missing_paths:
+                problems.append(f"missing speaker stores: {', '.join(missing_paths)}")
+            if missing_usage:
+                problems.append(f"missing usage summaries: {', '.join(missing_usage)}")
+            raise FileNotFoundError(
+                "mem0_local search requires a completed add run for the same output_root; "
+                + "; ".join(problems)
+            )
+
     def search_memory(self, memory, user_id, query):
         start = time.time()
         memories = memory.search(query, user_id=user_id, limit=self.top_k)
@@ -460,6 +506,7 @@ class MemoryLocalSearch:
             speaker_a = conversation["speaker_a"]
             speaker_b = conversation["speaker_b"]
 
+            self._validate_conversation_runtime(idx)
             speaker_a_user_id = f"{speaker_a}_{idx}"
             speaker_b_user_id = f"{speaker_b}_{idx}"
             memory_a = self._speaker_runtime(idx, "speaker_a")

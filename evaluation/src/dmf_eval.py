@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from collections import defaultdict
@@ -94,6 +95,9 @@ class DMFManager:
     def _conversation_runtime_paths(self, conversation_id):
         slug = self._slugify(conversation_id)
         conversation_root = self.run_root / slug
+        # Always recreate per-conversation state so reruns cannot reuse stale DMF storage.
+        if conversation_root.exists():
+            shutil.rmtree(conversation_root)
         conversation_root.mkdir(parents=True, exist_ok=True)
         chroma_path = conversation_root / "chroma"
         storage_path = conversation_root / "ltm_archive.jsonl"
