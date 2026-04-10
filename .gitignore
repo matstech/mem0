@@ -190,3 +190,8 @@ eval/
 qdrant_storage/
 .crossnote
 testing.ipynb
+evaluation/models/*
+evaluation/run/*
+evaluation/dataset/*
+evaluation/results/*
+paperpdf

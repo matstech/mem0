@@ -59,8 +59,8 @@ def calculate_rouge_scores(prediction: str, reference: str) -> Dict[str, float]:
 
 def calculate_bleu_scores(prediction: str, reference: str) -> Dict[str, float]:
     """Calculate BLEU scores with different n-gram settings."""
-    pred_tokens = nltk.word_tokenize(prediction.lower())
-    ref_tokens = [nltk.word_tokenize(reference.lower())]
+    pred_tokens = simple_tokenize(prediction)
+    ref_tokens = [simple_tokenize(reference)]
 
     weights_list = [(1, 0, 0, 0), (0.5, 0.5, 0, 0), (0.33, 0.33, 0.33, 0), (0.25, 0.25, 0.25, 0.25)]
     smooth = SmoothingFunction().method1

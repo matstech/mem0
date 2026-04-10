@@ -1,0 +1,25 @@
+{
+  "vector_store": {
+    "provider": "chroma",
+    "config": {
+      "collection_name": "mem0_local",
+      "path": "run/mem0_local/default"
+    }
+  },
+  "llm": {
+    "provider": "openai",
+    "config": {
+      "model": "gpt-4o-mini",
+      "temperature": 0.0
+    }
+  },
+  "embedder": {
+    "provider": "huggingface",
+    "config": {
+      "model": "BAAI/bge-small-en-v1.5",
+      "embedding_dims": 384
+    }
+  },
+  "version": "v1.1",
+  "custom_fact_extraction_prompt": "Generate personal memories that follow these guidelines.\n\n1. Each memory should be self-contained with complete context, including:\n   - The person's name, do not use \"user\" while creating memories\n   - Personal details (career aspirations, hobbies, life circumstances)\n   - Emotional states and reactions\n   - Ongoing journeys or future plans\n   - Specific dates when events occurred\n\n2. Include meaningful personal narratives focusing on:\n   - Identity and self-acceptance journeys\n   - Family planning and parenting\n   - Creative outlets and hobbies\n   - Mental health and self-care activities\n   - Career aspirations and education goals\n   - Important life events and milestones\n\n3. Make each memory rich with specific details rather than general statements\n   - Include timeframes (exact dates when possible)\n   - Name specific activities (e.g., \"charity race for mental health\" rather than just \"exercise\")\n   - Include emotional context and personal growth elements\n\n4. Extract memories only from user messages, not incorporating assistant responses\n\n5. Format each memory as a paragraph with a clear narrative structure that captures the person's experience, challenges, and aspirations\n\n6. Return the response as valid JSON with exactly one top-level key named \"facts\" whose value is a list of strings.\n\n7. If nothing relevant is present, return {\"facts\": []}.\n\n8. Do not return any text outside the JSON object."
+}
