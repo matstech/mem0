@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 from collections import defaultdict
 
 import numpy as np
@@ -16,9 +17,9 @@ except Exception:
 client = OpenAI(api_key=None if not __import__("os").getenv("OPENAI_API_KEY") else __import__("os").getenv("OPENAI_API_KEY"))
 
 ACCURACY_PROMPT = """
-Your task is to label an answer to a question as ’CORRECT’ or ’WRONG’. You will be given the following data:
+Your task is to label an answer to a question as CORRECT or WRONG. You will be given the following data:
     (1) a question (posed by one user to another user), 
-    (2) a ’gold’ (ground truth) answer, 
+    (2) a gold (ground truth) answer, 
     (3) a generated answer
 which you will score as CORRECT/WRONG.
 
@@ -35,29 +36,47 @@ Question: {question}
 Gold answer: {gold_answer}
 Generated answer: {generated_answer}
 
-First, provide a short (one sentence) explanation of your reasoning, then finish with CORRECT or WRONG. 
-Do NOT include both CORRECT and WRONG in your response, or it will break the evaluation script.
-
-Just return the label CORRECT or WRONG in a json format with the key as "label".
+Return only one label: CORRECT or WRONG.
+Do not add explanations, punctuation, or any other text.
 """
+
+
+def _sanitize_text(value):
+    """Remove characters that can break downstream API serialization."""
+    text = str(value)
+    text = text.replace("\x00", "")
+    return text.encode("utf-8", "replace").decode("utf-8")
 
 
 def evaluate_llm_judge(question, gold_answer, generated_answer):
     """Evaluate the generated answer against the gold answer using an LLM judge."""
+    prompt = ACCURACY_PROMPT.format(
+        question=_sanitize_text(question),
+        gold_answer=_sanitize_text(gold_answer),
+        generated_answer=_sanitize_text(generated_answer),
+    )
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {
                 "role": "user",
-                "content": ACCURACY_PROMPT.format(
-                    question=question, gold_answer=gold_answer, generated_answer=generated_answer
-                ),
+                "content": prompt,
             }
         ],
-        response_format={"type": "json_object"},
         temperature=0.0,
     )
-    label = json.loads(extract_json(response.choices[0].message.content))["label"]
+    content = (response.choices[0].message.content or "").strip()
+    normalized = content.upper()
+    if normalized == "CORRECT":
+        label = "CORRECT"
+    elif normalized == "WRONG":
+        label = "WRONG"
+    else:
+        matches = re.findall(r"\b(CORRECT|WRONG)\b", normalized)
+        if matches:
+            label = matches[-1]
+        else:
+            label = json.loads(extract_json(content))["label"].upper()
     return 1 if label == "CORRECT" else 0
 
 

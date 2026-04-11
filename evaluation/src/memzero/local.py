@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import time
 from collections import defaultdict
 from copy import deepcopy
@@ -8,15 +9,28 @@ from datetime import datetime
 from pathlib import Path
 
 from jinja2 import Template
-from openai import OpenAI
 from mem0.configs.prompts import get_update_memory_messages
 from mem0.memory.telemetry import capture_event
 from mem0.memory.utils import get_fact_retrieval_messages, parse_messages, process_telemetry_filters, remove_code_blocks
+from openai import BadRequestError, OpenAI
 from prompts import ANSWER_PROMPT
 from tqdm import tqdm
 
 from mem0 import Memory
 from src.runtime_config import apply_runtime_env, get_answer_model, get_embedding_settings
+from src.token_accounting import (
+    build_run_summary,
+    bundle_artifact_dir,
+    copy_snapshot,
+    generate_reporting,
+    make_phase_tokens,
+    make_token_breakdown,
+    prepare_artifact_dir,
+    sum_phase_totals,
+    write_json,
+    write_summary_markdown,
+    zero_phase_tokens,
+)
 
 try:
     from dotenv import load_dotenv
@@ -32,6 +46,26 @@ except ImportError:  # pragma: no cover - fallback for lightweight smoke runs
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_openai_text(value):
+    """Remove control characters that can break provider-side JSON parsing."""
+    text = str(value or "")
+    text = text.replace("\x00", "")
+    text = text.encode("utf-8", "replace").decode("utf-8")
+    return re.sub(r"[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]", " ", text)
+
+
+def _sanitize_openai_messages(messages):
+    sanitized = []
+    for message in messages:
+        sanitized.append(
+            {
+                "role": message.get("role", "user"),
+                "content": _sanitize_openai_text(message.get("content", "")),
+            }
+        )
+    return sanitized
 
 
 class LLMUsageTracker:
@@ -83,7 +117,8 @@ class SafeMemory(Memory):
         if not infer:
             return super()._add_to_vector_store(messages, metadata, filters, infer)
 
-        parsed_messages = parse_messages(messages)
+        sanitized_messages = _sanitize_openai_messages(messages)
+        parsed_messages = parse_messages(sanitized_messages)
 
         if self.config.custom_fact_extraction_prompt:
             system_prompt = self.config.custom_fact_extraction_prompt
@@ -91,13 +126,21 @@ class SafeMemory(Memory):
         else:
             system_prompt, user_prompt = get_fact_retrieval_messages(parsed_messages)
 
-        response = self.llm.generate_response(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format={"type": "json_object"},
-        )
+        fact_messages = [
+            {"role": "system", "content": _sanitize_openai_text(system_prompt)},
+            {"role": "user", "content": _sanitize_openai_text(user_prompt)},
+        ]
+        try:
+            response = self.llm.generate_response(
+                messages=fact_messages,
+                response_format={"type": "json_object"},
+            )
+        except BadRequestError:
+            logger.exception("BadRequest during fact extraction; retrying with sanitized payload.")
+            response = self.llm.generate_response(
+                messages=_sanitize_openai_messages(fact_messages),
+                response_format={"type": "json_object"},
+            )
 
         try:
             response = remove_code_blocks(response)
@@ -138,8 +181,15 @@ class SafeMemory(Memory):
             )
 
             try:
+                update_messages = [{"role": "user", "content": _sanitize_openai_text(function_calling_prompt)}]
                 response = self.llm.generate_response(
-                    messages=[{"role": "user", "content": function_calling_prompt}],
+                    messages=update_messages,
+                    response_format={"type": "json_object"},
+                )
+            except BadRequestError:
+                logger.exception("BadRequest during memory update planning; retrying with sanitized payload.")
+                response = self.llm.generate_response(
+                    messages=_sanitize_openai_messages(update_messages),
                     response_format={"type": "json_object"},
                 )
             except Exception as e:
@@ -317,12 +367,13 @@ class MemoryLocalAdd:
         messages = []
         messages_reverse = []
         for chat in chats:
+            chat_text = _sanitize_openai_text(chat["text"])
             if chat["speaker"] == speaker_a:
-                messages.append({"role": "user", "content": f"{speaker_a}: {chat['text']}"})
-                messages_reverse.append({"role": "assistant", "content": f"{speaker_a}: {chat['text']}"})
+                messages.append({"role": "user", "content": f"{speaker_a}: {chat_text}"})
+                messages_reverse.append({"role": "assistant", "content": f"{speaker_a}: {chat_text}"})
             elif chat["speaker"] == speaker_b:
-                messages.append({"role": "assistant", "content": f"{speaker_b}: {chat['text']}"})
-                messages_reverse.append({"role": "user", "content": f"{speaker_b}: {chat['text']}"})
+                messages.append({"role": "assistant", "content": f"{speaker_b}: {chat_text}"})
+                messages_reverse.append({"role": "user", "content": f"{speaker_b}: {chat_text}"})
             else:
                 raise ValueError(f"Unknown speaker: {chat['speaker']}")
         return messages, messages_reverse
@@ -387,6 +438,7 @@ class MemoryLocalSearch:
         self.runtime_config = runtime_config or {}
         apply_runtime_env(self.runtime_config)
         self.results = defaultdict(list)
+        self.conversation_summaries = []
         openai_kwargs = {}
         base_url = os.getenv("OPENAI_BASE_URL")
         if base_url:
@@ -394,6 +446,8 @@ class MemoryLocalSearch:
         self.openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), **openai_kwargs)
         self.answer_template = Template(ANSWER_PROMPT)
         self.tokenizer = tiktoken.get_encoding("cl100k_base") if tiktoken is not None else None
+        self.artifact_info = prepare_artifact_dir(self.output_path.parent, "mem0_local_token_accounting")
+        self.dataset_path = None
 
     def _load_base_config(self):
         with self.config_path.open("r", encoding="utf-8") as f:
@@ -463,6 +517,7 @@ class MemoryLocalSearch:
     def answer_question(self, memory_a, memory_b, speaker_a_user_id, speaker_b_user_id, question):
         speaker_1_memories, speaker_1_memory_time = self.search_memory(memory_a, speaker_a_user_id, question)
         speaker_2_memories, speaker_2_memory_time = self.search_memory(memory_b, speaker_b_user_id, question)
+        total_search_time = speaker_1_memory_time + speaker_2_memory_time
 
         search_1_memory = [f"{item['timestamp']}: {item['memory']}" for item in speaker_1_memories]
         search_2_memory = [f"{item['timestamp']}: {item['memory']}" for item in speaker_2_memories]
@@ -472,7 +527,7 @@ class MemoryLocalSearch:
             speaker_2_user_id=speaker_b_user_id.split("_")[0],
             speaker_1_memories=json.dumps(search_1_memory, indent=4),
             speaker_2_memories=json.dumps(search_2_memory, indent=4),
-            question=question,
+            question=_sanitize_openai_text(question),
         )
 
         start = time.time()
@@ -482,6 +537,7 @@ class MemoryLocalSearch:
             temperature=0.0,
         )
         end = time.time()
+        usage = getattr(response, "usage", None)
 
         return {
             "response": response.choices[0].message.content.strip(),
@@ -489,12 +545,113 @@ class MemoryLocalSearch:
             "speaker_2_memories": speaker_2_memories,
             "speaker_1_memory_time": speaker_1_memory_time,
             "speaker_2_memory_time": speaker_2_memory_time,
+            "search_time": total_search_time,
             "response_time": end - start,
             "prompt_tokens_total": self._count_tokens(answer_prompt),
             "context_tokens": self._count_tokens("\n".join(search_1_memory + search_2_memory)),
+            "answer_usage": {
+                "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0) if usage is not None else None,
+                "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0) if usage is not None else None,
+                "total_tokens": int(getattr(usage, "total_tokens", 0) or 0) if usage is not None else None,
+                "observation_mode": "provider_reported" if usage is not None else "estimated_local",
+            },
         }
 
+    def _question_token_bundle(self, answer_bundle):
+        answer_usage = answer_bundle["answer_usage"]
+        if answer_usage["observation_mode"] == "provider_reported":
+            answer_phase = make_phase_tokens(
+                answer_usage["prompt_tokens"],
+                answer_usage["completion_tokens"],
+                answer_usage["total_tokens"],
+                "provider_reported",
+            )
+        else:
+            estimated_prompt_tokens = int(answer_bundle["prompt_tokens_total"] or 0)
+            answer_phase = make_phase_tokens(
+                estimated_prompt_tokens,
+                None,
+                estimated_prompt_tokens,
+                "estimated_local",
+            )
+        token_breakdown = make_token_breakdown(
+            ingest=zero_phase_tokens(),
+            retrieval=zero_phase_tokens(),
+            answer=answer_phase,
+            maintenance=zero_phase_tokens(),
+        )
+        return {
+            "total_tokens": sum_phase_totals(token_breakdown),
+            "token_breakdown": token_breakdown,
+        }
+
+    def _conversation_summary(
+        self,
+        conversation_idx,
+        question_results,
+        internal_prompt_tokens,
+        internal_completion_tokens,
+        internal_total_tokens,
+    ):
+        answer_prompt_values = [item["token_breakdown"]["answer"]["prompt_tokens"] for item in question_results]
+        answer_completion_values = [item["token_breakdown"]["answer"]["completion_tokens"] for item in question_results]
+        answer_total_values = [item["token_breakdown"]["answer"]["total_tokens"] for item in question_results]
+        answer_phase = make_phase_tokens(
+            sum(value or 0 for value in answer_prompt_values),
+            None if any(value is None for value in answer_completion_values) else sum(value or 0 for value in answer_completion_values),
+            sum(value or 0 for value in answer_total_values),
+            "provider_reported" if not any(value is None for value in answer_completion_values) else "estimated_local",
+        )
+        token_breakdown = make_token_breakdown(
+            ingest=make_phase_tokens(
+                internal_prompt_tokens,
+                internal_completion_tokens,
+                internal_total_tokens,
+                "provider_reported",
+            ),
+            retrieval=zero_phase_tokens(),
+            answer=answer_phase,
+            maintenance=zero_phase_tokens(),
+        )
+        return {
+            "conversation_id": str(conversation_idx),
+            "question_count": len(question_results),
+            "total_tokens": sum_phase_totals(token_breakdown),
+            "legacy_total_pipeline_tokens": sum(
+                int(item.get("total_pipeline_tokens_amortized", 0) or 0) for item in question_results
+            ),
+            "token_breakdown": token_breakdown,
+        }
+
+    def _write_token_accounting_artifacts(self):
+        timestamp = self.artifact_info["timestamp"]
+        run_summary = build_run_summary(
+            technique="mem0_local",
+            dataset_path=self.dataset_path or self.output_path,
+            result_output_path=self.output_path,
+            conversation_summaries=self.conversation_summaries,
+        )
+        artifact_dir = self.artifact_info["artifact_dir"]
+        write_json(artifact_dir / f"mem0_local_token_accounting_{timestamp}.json", run_summary)
+        generate_reporting(self.artifact_info, "mem0_local", run_summary)
+        snapshots = [
+            copy_snapshot(self.output_path, artifact_dir, "mem0_local_results.json"),
+            copy_snapshot(self.config_path, artifact_dir, "config_snapshot.json"),
+            copy_snapshot(self.runtime_config.get("_config_path"), artifact_dir, "runtime_config_snapshot.toml"),
+        ]
+        write_summary_markdown(
+            artifact_dir / "summary.md",
+            technique="mem0_local",
+            run_summary=run_summary,
+            snapshots=[snapshot for snapshot in snapshots if snapshot],
+            notes=[
+                "mem0_local maintenance is currently folded into ingest because the OSS runtime does not expose it separately.",
+            ],
+        )
+        bundle_artifact_dir(artifact_dir, self.artifact_info["zip_path"])
+
     def process_data_file(self, file_path):
+        self.dataset_path = Path(file_path)
         with open(file_path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
@@ -520,6 +677,7 @@ class MemoryLocalSearch:
             amortized_internal_total = internal_total_tokens / len(qa) if qa else 0.0
             amortized_internal_prompt = internal_prompt_tokens / len(qa) if qa else 0.0
             amortized_internal_completion = internal_completion_tokens / len(qa) if qa else 0.0
+            question_results = []
 
             for question_item in tqdm(qa, total=len(qa), desc=f"Processing questions for conversation {idx}", leave=False):
                 answer_bundle = self.answer_question(
@@ -529,6 +687,7 @@ class MemoryLocalSearch:
                     speaker_b_user_id,
                     question_item.get("question", ""),
                 )
+                question_token_bundle = self._question_token_bundle(answer_bundle)
                 result = {
                     "question": question_item.get("question", ""),
                     "answer": question_item.get("answer", ""),
@@ -542,6 +701,7 @@ class MemoryLocalSearch:
                     "num_speaker_2_memories": len(answer_bundle["speaker_2_memories"]),
                     "speaker_1_memory_time": answer_bundle["speaker_1_memory_time"],
                     "speaker_2_memory_time": answer_bundle["speaker_2_memory_time"],
+                    "search_time": answer_bundle["search_time"],
                     "response_time": answer_bundle["response_time"],
                     "context_tokens": answer_bundle["context_tokens"],
                     "prompt_tokens_total": answer_bundle["prompt_tokens_total"],
@@ -553,11 +713,25 @@ class MemoryLocalSearch:
                     "internal_llm_completion_tokens_amortized": amortized_internal_completion,
                     "internal_llm_total_tokens_amortized": amortized_internal_total,
                     "total_pipeline_tokens_amortized": answer_bundle["prompt_tokens_total"] + amortized_internal_total,
+                    "total_tokens": question_token_bundle["total_tokens"],
+                    "token_breakdown": question_token_bundle["token_breakdown"],
                     "storage_backend": "chroma",
                 }
                 self.results[idx].append(result)
+                question_results.append(result)
                 with self.output_path.open("w", encoding="utf-8") as f:
                     json.dump(self.results, f, indent=4)
 
+            self.conversation_summaries.append(
+                self._conversation_summary(
+                    idx,
+                    question_results,
+                    internal_prompt_tokens,
+                    internal_completion_tokens,
+                    internal_total_tokens,
+                )
+            )
+
         with self.output_path.open("w", encoding="utf-8") as f:
             json.dump(self.results, f, indent=4)
+        self._write_token_accounting_artifacts()

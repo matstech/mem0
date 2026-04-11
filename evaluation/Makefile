@@ -38,3 +38,24 @@ run-openai:
 
 run-dmf:
 	python run_experiments.py --technique_type dmf --output_folder results/
+
+# Comparison Summary
+# Usage: make compare NAME=my_run BASELINES="Label1,res1,met1 Label2,res2,met2" NOTES="Optional notes"
+NAME ?= comparison_$(shell date +%Y%m%d_%H%M%S)
+NOTES ?= "Generated via Makefile"
+BASELINES ?= ""
+
+compare:
+	@if [ -z "$(BASELINES)" ]; then \
+		echo "Error: BASELINES variable is empty. Usage: make compare BASELINES=\"Label,res_path,met_path ...\""; \
+		exit 1; \
+	fi; \
+	CMD="python3 comparison_summary/run_comparison.py --comparison-name \"$(NAME)\" --notes \"$(NOTES)\""; \
+	for b in $(BASELINES); do \
+		CMD="$$CMD --baseline $$b"; \
+	done; \
+	eval $$CMD
+
+clean-comparisons:
+	rm -rf results/comparison_summary/*
+
