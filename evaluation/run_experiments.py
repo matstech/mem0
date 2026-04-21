@@ -1,4 +1,5 @@
 import argparse
+import logging
 import os
 from pathlib import Path
 
@@ -96,8 +97,28 @@ def main():
         default=DEFAULT_MEM0_LOCAL_OUTPUT_ROOT,
         help="Root directory for local Mem0 vector stores",
     )
+    parser.add_argument(
+        "--log_progress",
+        action="store_true",
+        default=False,
+        help="Emit structured progress logs for Mem0 benchmarks.",
+    )
+    parser.add_argument(
+        "--progress_mode",
+        choices=("detailed", "parallel"),
+        default="detailed",
+        help="Progress logging mode for Mem0 benchmarks.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help="Resume mem0_local benchmarks from existing local artifacts when possible.",
+    )
 
     args = parser.parse_args()
+    if args.log_progress:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     runtime_config = load_runtime_config(args.runtime_config_path)
     dmf_cfg = runtime_config.get("dmf", {})
     mem0_local_cfg = runtime_config.get("mem0_local", {})
@@ -130,14 +151,26 @@ def main():
         from src.memzero.search import MemorySearch
 
         if args.method == "add":
-            memory_manager = MemoryADD(data_path=args.locomo_json_path, is_graph=args.is_graph)
+            memory_manager = MemoryADD(
+                data_path=args.locomo_json_path,
+                is_graph=args.is_graph,
+                log_progress=args.log_progress,
+                progress_mode=args.progress_mode,
+            )
             memory_manager.process_all_conversations()
         elif args.method == "search":
             output_file_path = os.path.join(
                 args.output_folder,
                 f"mem0_results_top_{args.top_k}_filter_{args.filter_memories}_graph_{args.is_graph}.json",
             )
-            memory_searcher = MemorySearch(output_file_path, args.top_k, args.filter_memories, args.is_graph)
+            memory_searcher = MemorySearch(
+                output_file_path,
+                args.top_k,
+                args.filter_memories,
+                args.is_graph,
+                log_progress=args.log_progress,
+                progress_mode=args.progress_mode,
+            )
             memory_searcher.process_data_file(args.locomo_json_path)
     elif args.technique_type == "mem0_local":
         from src.memzero.local import MemoryLocalAdd, MemoryLocalSearch
@@ -148,6 +181,9 @@ def main():
                 config_path=mem0_local_config_path,
                 output_root=mem0_local_output_root,
                 runtime_config=runtime_config,
+                log_progress=args.log_progress,
+                progress_mode=args.progress_mode,
+                resume=args.resume,
             )
             memory_manager.process_all_conversations()
         elif args.method == "search":
@@ -158,6 +194,9 @@ def main():
                 output_root=mem0_local_output_root,
                 runtime_config=runtime_config,
                 top_k=args.top_k,
+                log_progress=args.log_progress,
+                progress_mode=args.progress_mode,
+                resume=args.resume,
             )
             memory_searcher.process_data_file(args.locomo_json_path)
     elif args.technique_type == "rag":

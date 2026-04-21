@@ -15,8 +15,18 @@ run-mem0-plus-search:
 run-mem0-local-add:
 	python run_experiments.py --technique_type mem0_local --method add --output_folder results/
 
+run-mem0-local-add-resume:
+	python run_experiments.py --technique_type mem0_local --method add --output_folder results/ --resume
+
 run-mem0-local-search:
 	python run_experiments.py --technique_type mem0_local --method search --output_folder results/ --top_k 30
+
+run-mem0-local: run-mem0-local-add run-mem0-local-search
+
+run-mem0-local-search-resume:
+	python run_experiments.py --technique_type mem0_local --method search --output_folder results/ --top_k 30 --resume
+
+run-mem0-local-resume: run-mem0-local-add-resume run-mem0-local-search-resume
 
 run-rag:
 	python run_experiments.py --technique_type rag --chunk_size 500 --num_chunks 1 --output_folder results/
@@ -58,4 +68,3 @@ compare:
 
 clean-comparisons:
 	rm -rf results/comparison_summary/*
-
