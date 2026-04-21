@@ -1,30 +1,40 @@
 
+PROGRESS_MODE ?= detailed
+
+ifeq ($(LOG_PROGRESS),1)
+PROGRESS_ARGS := --log_progress --progress_mode $(PROGRESS_MODE)
+else ifeq ($(LOG_PROGRESS),true)
+PROGRESS_ARGS := --log_progress --progress_mode $(PROGRESS_MODE)
+else
+PROGRESS_ARGS :=
+endif
+
 # Run the experiments
 run-mem0-add:
-	python run_experiments.py --technique_type mem0 --method add
+	python run_experiments.py --technique_type mem0 --method add $(PROGRESS_ARGS)
 
 run-mem0-search:
-	python run_experiments.py --technique_type mem0 --method search --output_folder results/ --top_k 30
+	python run_experiments.py --technique_type mem0 --method search --output_folder results/ --top_k 30 $(PROGRESS_ARGS)
 
 run-mem0-plus-add:
-	python run_experiments.py --technique_type mem0 --method add --is_graph
+	python run_experiments.py --technique_type mem0 --method add --is_graph $(PROGRESS_ARGS)
 
 run-mem0-plus-search:
-	python run_experiments.py --technique_type mem0 --method search --is_graph --output_folder results/ --top_k 30
+	python run_experiments.py --technique_type mem0 --method search --is_graph --output_folder results/ --top_k 30 $(PROGRESS_ARGS)
 
 run-mem0-local-add:
-	python run_experiments.py --technique_type mem0_local --method add --output_folder results/
+	python run_experiments.py --technique_type mem0_local --method add --output_folder results/ $(PROGRESS_ARGS)
 
 run-mem0-local-add-resume:
-	python run_experiments.py --technique_type mem0_local --method add --output_folder results/ --resume
+	python run_experiments.py --technique_type mem0_local --method add --output_folder results/ --resume $(PROGRESS_ARGS)
 
 run-mem0-local-search:
-	python run_experiments.py --technique_type mem0_local --method search --output_folder results/ --top_k 30
+	python run_experiments.py --technique_type mem0_local --method search --output_folder results/ --top_k 30 $(PROGRESS_ARGS)
 
 run-mem0-local: run-mem0-local-add run-mem0-local-search
 
 run-mem0-local-search-resume:
-	python run_experiments.py --technique_type mem0_local --method search --output_folder results/ --top_k 30 --resume
+	python run_experiments.py --technique_type mem0_local --method search --output_folder results/ --top_k 30 --resume $(PROGRESS_ARGS)
 
 run-mem0-local-resume: run-mem0-local-add-resume run-mem0-local-search-resume
 
