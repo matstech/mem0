@@ -24,6 +24,7 @@ from prompts import ANSWER_PROMPT
 from tqdm import tqdm
 
 from mem0 import Memory
+from src.memzero.progress import Mem0BenchmarkProgress
 from src.runtime_config import apply_runtime_env, get_answer_model, get_embedding_settings
 from src.token_accounting import (
     build_run_summary,
@@ -336,11 +337,16 @@ class MemoryLocalAdd:
         config_path="config/mem0_local_config.json",
         output_root="run/mem0_local_v1",
         runtime_config=None,
+        log_progress=False,
+        progress_mode="detailed",
+        resume=False,
     ):
         self.data_path = data_path
         self.config_path = Path(config_path)
         self.output_root = Path(output_root)
         self.runtime_config = runtime_config or {}
+        self.progress = Mem0BenchmarkProgress("mem0_local:add", enabled=log_progress, mode=progress_mode)
+        self.resume = resume
         apply_runtime_env(self.runtime_config)
         self.data = None
         if data_path:
@@ -411,20 +417,70 @@ class MemoryLocalAdd:
         for _, key, timestamp, chats in sorted(sessions, key=lambda item: (item[0], item[1])):
             yield key, timestamp, chats
 
+    def _conversation_sessions(self, conversation):
+        return list(self._iter_sessions(conversation))
+
+    def _conversation_add_completed(self, conversation_idx):
+        usage_path = _conversation_usage_path(self.output_root, conversation_idx)
+        speaker_a_store = _speaker_store_path(self.output_root, conversation_idx, "speaker_a")
+        speaker_b_store = _speaker_store_path(self.output_root, conversation_idx, "speaker_b")
+        return usage_path.exists() and speaker_a_store.exists() and speaker_b_store.exists()
+
+    def _resume_start_index(self):
+        if not self.resume:
+            return 0
+        for idx, item in enumerate(self.data or []):
+            if not self._conversation_add_completed(idx):
+                return idx
+        return len(self.data or [])
+
     def process_conversation(self, item, idx):
         conversation = item["conversation"]
         speaker_a = conversation["speaker_a"]
         speaker_b = conversation["speaker_b"]
         speaker_a_user_id = f"{speaker_a}_{idx}"
         speaker_b_user_id = f"{speaker_b}_{idx}"
+        sessions = self._conversation_sessions(conversation)
+
+        self.progress.start_conversation(
+            idx,
+            conversation_id=str(idx),
+            total_units=len(sessions),
+            unit_label="session",
+            note="starting local memory ingestion",
+        )
 
         memory_a = self._speaker_runtime(idx, "speaker_a")
         memory_b = self._speaker_runtime(idx, "speaker_b")
 
-        for _, timestamp, chats in self._iter_sessions(conversation):
+        for session_idx, (session_key, timestamp, chats) in enumerate(sessions, start=1):
+            self.progress.log_step(
+                phase="ingest",
+                step="session_start",
+                current_unit=session_idx,
+                note=f"preparing session={session_key}",
+            )
             messages, messages_reverse = self._build_speaker_messages(chats, speaker_a, speaker_b)
+            self.progress.log_step(
+                phase="ingest",
+                step="adding_speaker_a",
+                current_unit=session_idx,
+                note=f"speaker={speaker_a_user_id}",
+            )
             memory_a.add(messages, user_id=speaker_a_user_id, metadata={"timestamp": timestamp})
+            self.progress.log_step(
+                phase="ingest",
+                step="adding_speaker_b",
+                current_unit=session_idx,
+                note=f"speaker={speaker_b_user_id}",
+            )
             memory_b.add(messages_reverse, user_id=speaker_b_user_id, metadata={"timestamp": timestamp})
+            self.progress.mark_unit_complete(
+                phase="ingest",
+                step="session_complete",
+                current_unit=session_idx,
+                note=f"completed session={session_key}",
+            )
 
         _write_conversation_usage_summary(
             self.output_root,
@@ -434,13 +490,37 @@ class MemoryLocalAdd:
                 "speaker_b": _normalize_mem0_usage(memory_b.get_llm_usage()),
             },
         )
+        self.progress.finish_conversation(note="conversation usage summary written")
 
     def process_all_conversations(self):
         if not self.data:
             raise ValueError("No data loaded. Please set data_path and call load_data() first.")
         self.output_root.mkdir(parents=True, exist_ok=True)
-        for idx, item in tqdm(enumerate(self.data), total=len(self.data), desc="Processing conversations"):
+        total_sessions = sum(len(self._conversation_sessions(item["conversation"])) for item in self.data)
+        self.progress.start_run(
+            total_conversations=len(self.data),
+            total_units=total_sessions,
+            unit_label="session",
+            note="starting mem0_local add benchmark",
+        )
+        start_idx = self._resume_start_index()
+        for idx, item in tqdm(
+            enumerate(self.data),
+            total=len(self.data),
+            desc="Processing conversations",
+            disable=self.progress.tqdm_disabled,
+        ):
+            conversation_sessions = self._conversation_sessions(item["conversation"])
+            if self.resume and idx < start_idx:
+                self.progress.mark_conversation_complete(
+                    conversation_index=idx,
+                    conversation_id=str(idx),
+                    unit_count=len(conversation_sessions),
+                    note="skipping completed local add conversation",
+                )
+                continue
             self.process_conversation(item, idx)
+        self.progress.finish_run(note="mem0_local add benchmark completed")
 
 
 class MemoryLocalSearch:
@@ -451,12 +531,17 @@ class MemoryLocalSearch:
         output_root="run/mem0_local_v1",
         top_k=30,
         runtime_config=None,
+        log_progress=False,
+        progress_mode="detailed",
+        resume=False,
     ):
         self.output_path = Path(output_path)
         self.config_path = Path(config_path)
         self.output_root = Path(output_root)
         self.top_k = top_k
         self.runtime_config = runtime_config or {}
+        self.progress = Mem0BenchmarkProgress("mem0_local:search", enabled=log_progress, mode=progress_mode)
+        self.resume = resume
         apply_runtime_env(self.runtime_config)
         self.results = defaultdict(list)
         self.conversation_summaries = []
@@ -533,7 +618,22 @@ class MemoryLocalSearch:
         ]
         return semantic_memories, end - start
 
-    def answer_question(self, memory_a, memory_b, speaker_a_user_id, speaker_b_user_id, question):
+    def answer_question(
+        self,
+        memory_a,
+        memory_b,
+        speaker_a_user_id,
+        speaker_b_user_id,
+        question,
+        *,
+        question_index=None,
+    ):
+        self.progress.log_step(
+            phase="search",
+            step="retrieving_memories",
+            current_unit=question_index,
+            note="retrieving local memories for both speakers",
+        )
         speaker_1_memories, speaker_1_memory_time = self.search_memory(memory_a, speaker_a_user_id, question)
         speaker_2_memories, speaker_2_memory_time = self.search_memory(memory_b, speaker_b_user_id, question)
         total_search_time = speaker_1_memory_time + speaker_2_memory_time
@@ -549,6 +649,12 @@ class MemoryLocalSearch:
             question=_sanitize_openai_text(question),
         )
 
+        self.progress.log_step(
+            phase="answer",
+            step="generating_answer",
+            current_unit=question_index,
+            note="calling answer model",
+        )
         start = time.time()
         response = self.openai_client.chat.completions.create(
             model=get_answer_model(self.runtime_config),
@@ -669,18 +775,66 @@ class MemoryLocalSearch:
         )
         bundle_artifact_dir(artifact_dir, self.artifact_info["zip_path"])
 
+    def _load_existing_results(self):
+        if not self.resume or not self.output_path.exists():
+            return
+        with self.output_path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        self.results = defaultdict(list, {str(key): value for key, value in payload.items()})
+
+    def _conversation_search_completed(self, conversation_idx, expected_question_count):
+        return len(self.results.get(str(conversation_idx), [])) >= expected_question_count
+
+    def _resume_start_index(self, data):
+        if not self.resume:
+            return 0
+        for idx, item in enumerate(data):
+            if not self._conversation_search_completed(idx, len(item["qa"])):
+                return idx
+        return len(data)
+
+    def _truncate_results_for_resume(self, start_idx):
+        if not self.resume:
+            return
+        keys_to_delete = [key for key in list(self.results.keys()) if int(key) >= start_idx]
+        for key in keys_to_delete:
+            del self.results[key]
+
     def process_data_file(self, file_path):
         self.dataset_path = Path(file_path)
         with open(file_path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._load_existing_results()
+        start_idx = self._resume_start_index(data)
+        self._truncate_results_for_resume(start_idx)
+        total_questions = sum(len(item["qa"]) for item in data)
+        self.progress.start_run(
+            total_conversations=len(data),
+            total_units=total_questions,
+            unit_label="question",
+            note="starting mem0_local search benchmark",
+        )
 
-        for idx, item in tqdm(enumerate(data), total=len(data), desc="Processing conversations"):
+        for idx, item in tqdm(
+            enumerate(data),
+            total=len(data),
+            desc="Processing conversations",
+            disable=self.progress.tqdm_disabled,
+        ):
             qa = item["qa"]
             conversation = item["conversation"]
             speaker_a = conversation["speaker_a"]
             speaker_b = conversation["speaker_b"]
+
+            self.progress.start_conversation(
+                idx,
+                conversation_id=str(idx),
+                total_units=len(qa),
+                unit_label="question",
+                note="starting local search conversation",
+            )
 
             self._validate_conversation_runtime(idx)
             speaker_a_user_id = f"{speaker_a}_{idx}"
@@ -695,15 +849,51 @@ class MemoryLocalSearch:
             amortized_internal_total = internal_total_tokens / len(qa) if qa else 0.0
             amortized_internal_prompt = internal_prompt_tokens / len(qa) if qa else 0.0
             amortized_internal_completion = internal_completion_tokens / len(qa) if qa else 0.0
+            if self.resume and idx < start_idx:
+                question_results = list(self.results.get(str(idx), []))
+                self.conversation_summaries.append(
+                    self._conversation_summary(
+                        idx,
+                        question_results,
+                        internal_prompt_tokens,
+                        internal_completion_tokens,
+                        internal_total_tokens,
+                    )
+                )
+                self.progress.mark_conversation_complete(
+                    conversation_index=idx,
+                    conversation_id=str(idx),
+                    unit_count=len(qa),
+                    note="skipping completed local search conversation",
+                )
+                continue
             question_results = []
+            self.results[str(idx)] = []
+            if self.resume and idx == start_idx and start_idx < len(data):
+                self.progress.log_step(
+                    phase="setup",
+                    step="resume_conversation",
+                    current_unit=1 if qa else None,
+                    note="restarting first incomplete conversation from scratch",
+                )
 
-            for question_item in tqdm(qa, total=len(qa), desc=f"Processing questions for conversation {idx}", leave=False):
+            for question_index, question_item in enumerate(
+                tqdm(
+                    qa,
+                    total=len(qa),
+                    desc=f"Processing questions for conversation {idx}",
+                    leave=False,
+                    disable=self.progress.tqdm_disabled,
+                ),
+                start=1,
+            ):
                 answer_bundle = self.answer_question(
                     memory_a,
                     memory_b,
                     speaker_a_user_id,
                     speaker_b_user_id,
                     question_item.get("question", ""),
+                    question_index=question_index,
                 )
                 question_token_bundle = self._question_token_bundle(answer_bundle)
                 result = {
@@ -735,10 +925,22 @@ class MemoryLocalSearch:
                     "token_breakdown": question_token_bundle["token_breakdown"],
                     "storage_backend": "chroma",
                 }
-                self.results[idx].append(result)
+                self.results[str(idx)].append(result)
                 question_results.append(result)
+                self.progress.log_step(
+                    phase="persist",
+                    step="writing_partial_results",
+                    current_unit=question_index,
+                    note="writing incremental local search results",
+                )
                 with self.output_path.open("w", encoding="utf-8") as f:
                     json.dump(self.results, f, indent=4)
+                self.progress.mark_unit_complete(
+                    phase="persist",
+                    step="question_complete",
+                    current_unit=question_index,
+                    note="stored local question result",
+                )
 
             self.conversation_summaries.append(
                 self._conversation_summary(
@@ -749,7 +951,9 @@ class MemoryLocalSearch:
                     internal_total_tokens,
                 )
             )
+            self.progress.finish_conversation(note="local search conversation completed")
 
         with self.output_path.open("w", encoding="utf-8") as f:
             json.dump(self.results, f, indent=4)
         self._write_token_accounting_artifacts()
+        self.progress.finish_run(note="mem0_local search benchmark completed")

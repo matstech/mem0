@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import time
 from collections import defaultdict
@@ -11,12 +12,23 @@ from prompts import ANSWER_PROMPT, ANSWER_PROMPT_GRAPH
 from tqdm import tqdm
 
 from mem0 import MemoryClient
+from src.memzero.progress import Mem0BenchmarkProgress
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 
 class MemorySearch:
-    def __init__(self, output_path="results.json", top_k=10, filter_memories=False, is_graph=False):
+    def __init__(
+        self,
+        output_path="results.json",
+        top_k=10,
+        filter_memories=False,
+        is_graph=False,
+        log_progress=False,
+        progress_mode="detailed",
+    ):
         self.mem0_client = MemoryClient(
             api_key=os.getenv("MEM0_API_KEY"),
             org_id=os.getenv("MEM0_ORGANIZATION_ID"),
@@ -28,6 +40,8 @@ class MemorySearch:
         self.output_path = output_path
         self.filter_memories = filter_memories
         self.is_graph = is_graph
+        benchmark_name = "mem0:search_graph" if is_graph else "mem0:search"
+        self.progress = Mem0BenchmarkProgress(benchmark_name, enabled=log_progress, mode=progress_mode)
 
         if self.is_graph:
             self.ANSWER_PROMPT = ANSWER_PROMPT_GRAPH
@@ -40,7 +54,7 @@ class MemorySearch:
         while retries < max_retries:
             try:
                 if self.is_graph:
-                    print("Searching with graph")
+                    logger.info("Searching with graph")
                     memories = self.mem0_client.search(
                         query,
                         user_id=user_id,
@@ -55,7 +69,7 @@ class MemorySearch:
                     )
                 break
             except Exception as e:
-                print("Retrying...")
+                logger.warning("Retrying search for user_id=%s after error: %s", user_id, e)
                 retries += 1
                 if retries >= max_retries:
                     raise e
@@ -87,7 +101,22 @@ class MemorySearch:
             ]
         return semantic_memories, graph_memories, end_time - start_time
 
-    def answer_question(self, speaker_1_user_id, speaker_2_user_id, question, answer, category):
+    def answer_question(
+        self,
+        speaker_1_user_id,
+        speaker_2_user_id,
+        question,
+        answer,
+        category,
+        *,
+        question_index=None,
+    ):
+        self.progress.log_step(
+            phase="search",
+            step="retrieving_memories",
+            current_unit=question_index,
+            note="searching memories for both speakers",
+        )
         speaker_1_memories, speaker_1_graph_memories, speaker_1_memory_time = self.search_memory(
             speaker_1_user_id, question
         )
@@ -109,6 +138,12 @@ class MemorySearch:
             question=question,
         )
 
+        self.progress.log_step(
+            phase="answer",
+            step="generating_answer",
+            current_unit=question_index,
+            note="calling answer model",
+        )
         t1 = time.time()
         response = self.openai_client.chat.completions.create(
             model=os.getenv("MODEL"), messages=[{"role": "system", "content": answer_prompt}], temperature=0.0
@@ -126,7 +161,7 @@ class MemorySearch:
             response_time,
         )
 
-    def process_question(self, val, speaker_a_user_id, speaker_b_user_id):
+    def process_question(self, val, speaker_a_user_id, speaker_b_user_id, *, question_index=None):
         question = val.get("question", "")
         answer = val.get("answer", "")
         category = val.get("category", -1)
@@ -142,7 +177,14 @@ class MemorySearch:
             speaker_1_graph_memories,
             speaker_2_graph_memories,
             response_time,
-        ) = self.answer_question(speaker_a_user_id, speaker_b_user_id, question, answer, category)
+        ) = self.answer_question(
+            speaker_a_user_id,
+            speaker_b_user_id,
+            question,
+            answer,
+            category,
+            question_index=question_index,
+        )
 
         result = {
             "question": question,
@@ -172,28 +214,76 @@ class MemorySearch:
         with open(file_path, "r") as f:
             data = json.load(f)
 
-        for idx, item in tqdm(enumerate(data), total=len(data), desc="Processing conversations"):
+        total_questions = sum(len(item["qa"]) for item in data)
+        self.progress.start_run(
+            total_conversations=len(data),
+            total_units=total_questions,
+            unit_label="question",
+            note="starting mem0 hosted search benchmark",
+        )
+
+        for idx, item in tqdm(
+            enumerate(data),
+            total=len(data),
+            desc="Processing conversations",
+            disable=self.progress.tqdm_disabled,
+        ):
             qa = item["qa"]
             conversation = item["conversation"]
             speaker_a = conversation["speaker_a"]
             speaker_b = conversation["speaker_b"]
 
+            self.progress.start_conversation(
+                idx,
+                conversation_id=str(idx),
+                total_units=len(qa),
+                unit_label="question",
+                note="starting question answering for conversation",
+            )
+
             speaker_a_user_id = f"{speaker_a}_{idx}"
             speaker_b_user_id = f"{speaker_b}_{idx}"
 
-            for question_item in tqdm(
-                qa, total=len(qa), desc=f"Processing questions for conversation {idx}", leave=False
+            for question_index, question_item in enumerate(
+                tqdm(
+                    qa,
+                    total=len(qa),
+                    desc=f"Processing questions for conversation {idx}",
+                    leave=False,
+                    disable=self.progress.tqdm_disabled,
+                ),
+                start=1,
             ):
-                result = self.process_question(question_item, speaker_a_user_id, speaker_b_user_id)
+                result = self.process_question(
+                    question_item,
+                    speaker_a_user_id,
+                    speaker_b_user_id,
+                    question_index=question_index,
+                )
                 self.results[idx].append(result)
 
                 # Save results after each question is processed
+                self.progress.log_step(
+                    phase="persist",
+                    step="writing_partial_results",
+                    current_unit=question_index,
+                    note="writing incremental search results",
+                )
                 with open(self.output_path, "w") as f:
                     json.dump(self.results, f, indent=4)
+                self.progress.mark_unit_complete(
+                    phase="persist",
+                    step="question_complete",
+                    current_unit=question_index,
+                    note="stored question result",
+                )
+
+            self.progress.finish_conversation(note="conversation search completed")
 
         # Final save at the end
         with open(self.output_path, "w") as f:
             json.dump(self.results, f, indent=4)
+        self.progress.finish_run(note="mem0 hosted search benchmark completed")
 
     def process_questions_parallel(self, qa_list, speaker_a_user_id, speaker_b_user_id, max_workers=1):
         def process_single_question(val):

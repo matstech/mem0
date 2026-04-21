@@ -85,6 +85,10 @@ make run-mem0-search      # Search memories using Mem0
 make run-mem0-plus-add    # Add memories using Mem0+
 make run-mem0-plus-search # Search memories using Mem0+
 
+# Run local Mem0 OSS experiments
+make run-mem0-local        # Run local Mem0 add + search end-to-end
+make run-mem0-local-resume # Resume local Mem0 from the first incomplete conversation
+
 # Run RAG experiments
 make run-rag              # Run RAG with chunk size 500
 make run-full-context     # Run RAG with full context
