@@ -8,7 +8,7 @@ import uuid
 import warnings
 from copy import deepcopy
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from pydantic import ValidationError
 
@@ -39,6 +39,7 @@ from mem0.utils.factory import (
     RerankerFactory,
     VectorStoreFactory,
 )
+from mem0.utils.llm_usage import LLMUsageCollector
 from mem0.utils.lemmatization import lemmatize_for_bm25
 from mem0.utils.scoring import (
     ENTITY_BOOST_WEIGHT,
@@ -98,6 +99,42 @@ _SENSITIVE_SUFFIXES = (
 
 # Entity parameters that must be passed via filters, not top-level kwargs
 ENTITY_PARAMS = frozenset({"user_id", "agent_id", "run_id"})
+
+
+def _is_openai_usage_trackable_llm(llm: Any) -> bool:
+    return (
+        llm is not None
+        and llm.__class__.__name__ == "OpenAILLM"
+        and llm.__class__.__module__ == "mem0.llms.openai"
+        and hasattr(getattr(llm, "config", None), "response_callback")
+    )
+
+
+def _chain_response_callbacks(
+    collector_callback: Callable[[Any, Any, Dict[str, Any]], None],
+    existing_callback: Optional[Callable[[Any, Any, Dict[str, Any]], None]],
+) -> Callable[[Any, Any, Dict[str, Any]], None]:
+    if existing_callback is None:
+        return collector_callback
+
+    def chained_callback(llm: Any, response: Any, params: Dict[str, Any]) -> None:
+        collector_callback(llm, response, params)
+        existing_callback(llm, response, params)
+
+    return chained_callback
+
+
+def _attach_llm_usage_collector(llm: Any, collector: LLMUsageCollector) -> bool:
+    if not _is_openai_usage_trackable_llm(llm):
+        return False
+
+    if getattr(llm, "_mem0_llm_usage_collector", None) is collector:
+        return True
+
+    existing_callback = getattr(llm.config, "response_callback", None)
+    llm.config.response_callback = _chain_response_callbacks(collector.callback, existing_callback)
+    llm._mem0_llm_usage_collector = collector
+    return True
 
 
 def _reject_top_level_entity_params(kwargs: Dict[str, Any], method_name: str) -> None:
@@ -331,6 +368,7 @@ logger = logging.getLogger(__name__)
 class Memory(MemoryBase):
     def __init__(self, config: MemoryConfig = MemoryConfig()):
         self.config = config
+        self._llm_usage = LLMUsageCollector()
 
         self.embedding_model = EmbedderFactory.create(
             self.config.embedder.provider,
@@ -341,6 +379,7 @@ class Memory(MemoryBase):
             self.config.vector_store.provider, self.config.vector_store.config
         )
         self.llm = LlmFactory.create(self.config.llm.provider, self.config.llm.config)
+        _attach_llm_usage_collector(self.llm, self._llm_usage)
         self.db = SQLiteManager(self.config.history_db_path)
         self.collection_name = self.config.vector_store.config.collection_name
         self.api_version = self.config.version
@@ -353,6 +392,8 @@ class Memory(MemoryBase):
                 config.reranker.provider,
                 config.reranker.config
             )
+            if hasattr(self.reranker, "llm"):
+                _attach_llm_usage_collector(self.reranker.llm, self._llm_usage)
 
         # Entity store is initialized lazily on first use
         self._entity_store = None
@@ -385,6 +426,12 @@ class Memory(MemoryBase):
                 self.config.vector_store.provider, telemetry_config
             )
         capture_event("mem0.init", self, {"sync_type": "sync"})
+
+    def get_llm_usage(self) -> Dict[str, Any]:
+        return self._llm_usage.snapshot()
+
+    def reset_llm_usage(self) -> None:
+        self._llm_usage.reset()
 
     @property
     def entity_store(self):
@@ -652,7 +699,8 @@ class Memory(MemoryBase):
             return results
 
         if self.config.llm.config.get("enable_vision"):
-            messages = parse_vision_messages(messages, self.llm, self.config.llm.config.get("vision_details"))
+            with self._llm_usage.scope("add.vision"):
+                messages = parse_vision_messages(messages, self.llm, self.config.llm.config.get("vision_details"))
         else:
             messages = parse_vision_messages(messages)
 
@@ -736,13 +784,14 @@ class Memory(MemoryBase):
         )
 
         try:
-            response = self.llm.generate_response(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                response_format={"type": "json_object"},
-            )
+            with self._llm_usage.scope("add.extraction"):
+                response = self.llm.generate_response(
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                )
         except Exception as e:
             logger.error(f"LLM extraction failed: {e}")
             return []
@@ -1229,7 +1278,8 @@ class Memory(MemoryBase):
         # Apply reranking if enabled and reranker is available
         if rerank and self.reranker and original_memories:
             try:
-                reranked_memories = self.reranker.rerank(query, original_memories, limit)
+                with self._llm_usage.scope("search.rerank"):
+                    reranked_memories = self.reranker.rerank(query, original_memories, limit)
                 original_memories = reranked_memories
             except Exception as e:
                 logger.warning(f"Reranking failed, using original results: {e}")
@@ -1636,7 +1686,8 @@ class Memory(MemoryBase):
         ]
 
         try:
-            procedural_memory = self.llm.generate_response(messages=parsed_messages)
+            with self._llm_usage.scope("add.procedural"):
+                procedural_memory = self.llm.generate_response(messages=parsed_messages)
             procedural_memory = remove_code_blocks(procedural_memory)
         except Exception as e:
             logger.error(f"Error generating procedural memory summary: {e}")
@@ -1795,6 +1846,7 @@ class Memory(MemoryBase):
 class AsyncMemory(MemoryBase):
     def __init__(self, config: MemoryConfig = MemoryConfig()):
         self.config = config
+        self._llm_usage = LLMUsageCollector()
 
         self.embedding_model = EmbedderFactory.create(
             self.config.embedder.provider,
@@ -1805,6 +1857,7 @@ class AsyncMemory(MemoryBase):
             self.config.vector_store.provider, self.config.vector_store.config
         )
         self.llm = LlmFactory.create(self.config.llm.provider, self.config.llm.config)
+        _attach_llm_usage_collector(self.llm, self._llm_usage)
         self.db = SQLiteManager(self.config.history_db_path)
         self.collection_name = self.config.vector_store.config.collection_name
         self.api_version = self.config.version
@@ -1818,6 +1871,8 @@ class AsyncMemory(MemoryBase):
                 config.reranker.provider,
                 config.reranker.config
             )
+            if hasattr(self.reranker, "llm"):
+                _attach_llm_usage_collector(self.reranker.llm, self._llm_usage)
 
         if MEM0_TELEMETRY:
             telemetry_config = _safe_deepcopy_config(self.config.vector_store.config)
@@ -1829,6 +1884,12 @@ class AsyncMemory(MemoryBase):
             self._telemetry_vector_store = VectorStoreFactory.create(self.config.vector_store.provider, telemetry_config)
 
         capture_event("mem0.init", self, {"sync_type": "async"})
+
+    def get_llm_usage(self) -> Dict[str, Any]:
+        return self._llm_usage.snapshot()
+
+    def reset_llm_usage(self) -> None:
+        self._llm_usage.reset()
 
     @property
     def entity_store(self):
@@ -2060,7 +2121,8 @@ class AsyncMemory(MemoryBase):
             return results
 
         if self.config.llm.config.get("enable_vision"):
-            messages = parse_vision_messages(messages, self.llm, self.config.llm.config.get("vision_details"))
+            with self._llm_usage.scope("add.vision"):
+                messages = parse_vision_messages(messages, self.llm, self.config.llm.config.get("vision_details"))
         else:
             messages = parse_vision_messages(messages)
 
@@ -2151,14 +2213,15 @@ class AsyncMemory(MemoryBase):
         )
 
         try:
-            response = await asyncio.to_thread(
-                self.llm.generate_response,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                response_format={"type": "json_object"},
-            )
+            with self._llm_usage.scope("add.extraction"):
+                response = await asyncio.to_thread(
+                    self.llm.generate_response,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                )
         except Exception as e:
             logger.error(f"LLM extraction failed (async): {e}")
             return []
@@ -2645,10 +2708,11 @@ class AsyncMemory(MemoryBase):
         # Apply reranking if enabled and reranker is available
         if rerank and self.reranker and original_memories:
             try:
-                # Run reranking in thread pool to avoid blocking async loop
-                reranked_memories = await asyncio.to_thread(
-                    self.reranker.rerank, query, original_memories, limit
-                )
+                with self._llm_usage.scope("search.rerank"):
+                    # Run reranking in thread pool to avoid blocking async loop
+                    reranked_memories = await asyncio.to_thread(
+                        self.reranker.rerank, query, original_memories, limit
+                    )
                 original_memories = reranked_memories
             except Exception as e:
                 logger.warning(f"Reranking failed, using original results: {e}")
@@ -3064,7 +3128,8 @@ class AsyncMemory(MemoryBase):
                 response = await asyncio.to_thread(llm.invoke, input=parsed_messages)
                 procedural_memory = response.content
             else:
-                procedural_memory = await asyncio.to_thread(self.llm.generate_response, messages=parsed_messages)
+                with self._llm_usage.scope("add.procedural"):
+                    procedural_memory = await asyncio.to_thread(self.llm.generate_response, messages=parsed_messages)
                 procedural_memory = remove_code_blocks(procedural_memory)
         
         except Exception as e:

@@ -168,7 +168,7 @@ We use several metrics to evaluate the performance of different memory technique
 1. **BLEU Score**: Measures the similarity between the model's response and the ground truth
 2. **F1 Score**: Measures the harmonic mean of precision and recall
 3. **LLM Score**: A binary score (0 or 1) determined by an LLM judge evaluating the correctness of responses
-4. **Token Consumption**: Number of tokens required to generate final answer.
+4. **Token Consumption**: Canonical per-phase token accounting when available; for `mem0_local` this includes internal Mem0 LLM ingest tokens plus answer-phase tokens.
 5. **Latency**: Time required during search and to generate response.
 
 ## 📚 Citation
@@ -195,4 +195,3 @@ If you use this code or dataset in your research, please cite our paper:
 - [Saket Aryan](https://github.com/whysosaket)
 - [Taranjeet Singh](https://github.com/taranjeet)
 - [Deshraj Yadav](https://github.com/deshraj)
-

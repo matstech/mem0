@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
-from mem0.memory.main import AsyncMemory, Memory
+from mem0.memory.main import AsyncMemory, Memory, _attach_llm_usage_collector
 
 
 def _setup_mocks(mocker):
@@ -25,6 +25,34 @@ def _setup_mocks(mocker):
     mocker.patch("mem0.memory.storage.SQLiteManager", mocker.MagicMock())
 
     return mock_llm, mock_vector_store
+
+
+def _make_openai_like_llm(callback=None):
+    llm_cls = type("OpenAILLM", (), {})
+    llm_cls.__module__ = "mem0.llms.openai"
+    llm = llm_cls()
+    llm.config = Mock()
+    llm.config.response_callback = callback
+    llm.generate_response = Mock(return_value="{}")
+    return llm
+
+
+def _make_openai_tracking_llm(response_content, *, prompt_tokens, completion_tokens, total_tokens=None, callback=None):
+    llm = _make_openai_like_llm(callback=callback)
+
+    def _generate_response(*args, **kwargs):
+        if llm.config.response_callback:
+            response = Mock()
+            response.usage = Mock(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens if total_tokens is not None else prompt_tokens + completion_tokens,
+            )
+            llm.config.response_callback(llm, response, kwargs)
+        return response_content
+
+    llm.generate_response = Mock(side_effect=_generate_response)
+    return llm
 
 
 class TestAddToVectorStoreErrors:
@@ -238,6 +266,210 @@ def test_update_memory_uses_utc_timestamps(mocker):
     payload = memory.vector_store.update.call_args.kwargs["payload"]
     assert payload["created_at"] == "2026-03-17T17:00:00-07:00"
     assert payload["updated_at"] is not None
+
+
+def test_memory_get_llm_usage_chains_openai_callback(mocker):
+    user_callback = Mock()
+    mocker.patch("mem0.utils.factory.EmbedderFactory.create", return_value=Mock())
+    mocker.patch("mem0.utils.factory.VectorStoreFactory.create", return_value=Mock())
+    mocker.patch("mem0.utils.factory.LlmFactory.create", return_value=_make_openai_like_llm(user_callback))
+    mocker.patch("mem0.memory.main.SQLiteManager", Mock())
+    mocker.patch("mem0.memory.main.MEM0_TELEMETRY", False)
+
+    memory = Memory()
+    response = Mock()
+    response.usage = Mock(prompt_tokens=13, completion_tokens=5, total_tokens=18)
+
+    memory.llm.config.response_callback(memory.llm, response, {"messages": []})
+
+    assert memory.get_llm_usage() == {
+        "prompt_tokens": 13,
+        "completion_tokens": 5,
+        "total_tokens": 18,
+        "calls": 1,
+        "scopes": {},
+    }
+    user_callback.assert_called_once_with(memory.llm, response, {"messages": []})
+
+
+def test_memory_reset_llm_usage_clears_counts(mocker):
+    mocker.patch("mem0.utils.factory.EmbedderFactory.create", return_value=Mock())
+    mocker.patch("mem0.utils.factory.VectorStoreFactory.create", return_value=Mock())
+    mocker.patch("mem0.utils.factory.LlmFactory.create", return_value=_make_openai_like_llm())
+    mocker.patch("mem0.memory.main.SQLiteManager", Mock())
+    mocker.patch("mem0.memory.main.MEM0_TELEMETRY", False)
+
+    memory = Memory()
+    response = Mock()
+    response.usage = Mock(prompt_tokens=4, completion_tokens=2, total_tokens=6)
+    memory.llm.config.response_callback(memory.llm, response, {"messages": []})
+
+    memory.reset_llm_usage()
+
+    assert memory.get_llm_usage() == {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "calls": 0,
+        "scopes": {},
+    }
+
+
+def test_async_memory_exposes_llm_usage(mocker):
+    mocker.patch("mem0.utils.factory.EmbedderFactory.create", return_value=Mock())
+    mocker.patch("mem0.utils.factory.VectorStoreFactory.create", return_value=Mock())
+    mocker.patch("mem0.utils.factory.LlmFactory.create", return_value=_make_openai_like_llm())
+    mocker.patch("mem0.memory.main.SQLiteManager", Mock())
+    mocker.patch("mem0.memory.main.MEM0_TELEMETRY", False)
+
+    memory = AsyncMemory()
+    response = Mock()
+    response.usage = Mock(prompt_tokens=8, completion_tokens=3, total_tokens=11)
+    memory.llm.config.response_callback(memory.llm, response, {"messages": []})
+
+    assert memory.get_llm_usage() == {
+        "prompt_tokens": 8,
+        "completion_tokens": 3,
+        "total_tokens": 11,
+        "calls": 1,
+        "scopes": {},
+    }
+
+
+def test_memory_add_tracks_extraction_scope(mocker):
+    tracking_llm = _make_openai_tracking_llm('{"memory": []}', prompt_tokens=12, completion_tokens=4)
+    mocker.patch("mem0.utils.factory.EmbedderFactory.create", return_value=Mock(embed=Mock(return_value=[0.1, 0.2, 0.3])))
+    mocker.patch("mem0.utils.factory.VectorStoreFactory.create", return_value=Mock(search=Mock(return_value=[])))
+    mocker.patch("mem0.utils.factory.LlmFactory.create", return_value=tracking_llm)
+    mocker.patch("mem0.memory.main.SQLiteManager", Mock())
+    mocker.patch("mem0.memory.main.MEM0_TELEMETRY", False)
+
+    memory = Memory()
+    memory.db.get_last_messages = Mock(return_value=[])
+    memory.db.save_messages = Mock()
+
+    result = memory.add([{"role": "user", "content": "remember this"}], user_id="u1")
+
+    assert result == {"results": []}
+    assert memory.get_llm_usage()["scopes"]["add.extraction"] == {
+        "prompt_tokens": 12,
+        "completion_tokens": 4,
+        "total_tokens": 16,
+        "calls": 1,
+    }
+
+
+def test_memory_add_tracks_vision_scope(mocker):
+    tracking_llm = _make_openai_like_llm()
+    mocker.patch("mem0.utils.factory.EmbedderFactory.create", return_value=Mock())
+    mocker.patch("mem0.utils.factory.VectorStoreFactory.create", return_value=Mock())
+    mocker.patch("mem0.utils.factory.LlmFactory.create", return_value=tracking_llm)
+    mocker.patch("mem0.memory.main.SQLiteManager", Mock())
+    mocker.patch("mem0.memory.main.MEM0_TELEMETRY", False)
+
+    memory = Memory()
+    memory.config.llm.config["enable_vision"] = True
+    memory._add_to_vector_store = Mock(return_value=[])
+
+    def _parse_vision_messages(messages, llm=None, vision_details="auto"):
+        response = Mock()
+        response.usage = Mock(prompt_tokens=7, completion_tokens=2, total_tokens=9)
+        llm.config.response_callback(llm, response, {"messages": messages, "vision_details": vision_details})
+        return [{"role": "user", "content": "image summary"}]
+
+    mocker.patch("mem0.memory.main.parse_vision_messages", side_effect=_parse_vision_messages)
+
+    result = memory.add(
+        [{"role": "user", "content": {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}}],
+        user_id="u1",
+        infer=False,
+    )
+
+    assert result == {"results": []}
+    assert memory.get_llm_usage()["scopes"]["add.vision"] == {
+        "prompt_tokens": 7,
+        "completion_tokens": 2,
+        "total_tokens": 9,
+        "calls": 1,
+    }
+
+
+def test_memory_procedural_tracks_scope(mocker):
+    tracking_llm = _make_openai_tracking_llm("procedural summary", prompt_tokens=9, completion_tokens=3)
+    mocker.patch("mem0.utils.factory.EmbedderFactory.create", return_value=Mock(embed=Mock(return_value=[0.1, 0.2, 0.3])))
+    mocker.patch("mem0.utils.factory.VectorStoreFactory.create", return_value=Mock())
+    mocker.patch("mem0.utils.factory.LlmFactory.create", return_value=tracking_llm)
+    mocker.patch("mem0.memory.main.SQLiteManager", Mock())
+    mocker.patch("mem0.memory.main.MEM0_TELEMETRY", False)
+
+    memory = Memory()
+    memory._create_memory = Mock(return_value="memory-id")
+
+    result = memory._create_procedural_memory([{"role": "user", "content": "hello"}], metadata={})
+
+    assert result == {"results": [{"id": "memory-id", "memory": "procedural summary", "event": "ADD"}]}
+    assert memory.get_llm_usage()["scopes"]["add.procedural"] == {
+        "prompt_tokens": 9,
+        "completion_tokens": 3,
+        "total_tokens": 12,
+        "calls": 1,
+    }
+
+
+def test_memory_search_tracks_rerank_scope(mocker):
+    mocker.patch("mem0.utils.factory.EmbedderFactory.create", return_value=Mock())
+    mocker.patch("mem0.utils.factory.VectorStoreFactory.create", return_value=Mock())
+    mocker.patch("mem0.utils.factory.LlmFactory.create", return_value=_make_openai_like_llm())
+    mocker.patch("mem0.memory.main.SQLiteManager", Mock())
+    mocker.patch("mem0.memory.main.MEM0_TELEMETRY", False)
+
+    memory = Memory()
+    memory._search_vector_store = Mock(return_value=[{"memory": "doc 1"}])
+    reranker_llm = _make_openai_tracking_llm("0.8", prompt_tokens=6, completion_tokens=1)
+    _attach_llm_usage_collector(reranker_llm, memory._llm_usage)
+    reranker = Mock()
+    reranker.llm = reranker_llm
+
+    def _rerank(query, docs, limit):
+        reranker_llm.generate_response(messages=[{"role": "user", "content": query}])
+        return [dict(docs[0], rerank_score=0.8)]
+
+    reranker.rerank = Mock(side_effect=_rerank)
+    memory.reranker = reranker
+
+    result = memory.search("who is this?", filters={"user_id": "u1"}, rerank=True)
+
+    assert result["results"] == [{"memory": "doc 1", "rerank_score": 0.8}]
+    assert memory.get_llm_usage()["scopes"]["search.rerank"] == {
+        "prompt_tokens": 6,
+        "completion_tokens": 1,
+        "total_tokens": 7,
+        "calls": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_async_memory_add_tracks_extraction_scope(mocker):
+    tracking_llm = _make_openai_tracking_llm('{"memory": []}', prompt_tokens=10, completion_tokens=5)
+    mocker.patch("mem0.utils.factory.EmbedderFactory.create", return_value=Mock(embed=Mock(return_value=[0.1, 0.2, 0.3])))
+    mocker.patch("mem0.utils.factory.VectorStoreFactory.create", return_value=Mock(search=Mock(return_value=[])))
+    mocker.patch("mem0.utils.factory.LlmFactory.create", return_value=tracking_llm)
+    mocker.patch("mem0.memory.main.SQLiteManager", Mock())
+    mocker.patch("mem0.memory.main.MEM0_TELEMETRY", False)
+
+    memory = AsyncMemory()
+    memory.db.get_last_messages = Mock(return_value=[])
+    memory.db.save_messages = Mock()
+
+    result = await memory.add([{"role": "user", "content": "remember this"}], user_id="u1")
+
+    assert result == {"results": []}
+    assert memory.get_llm_usage()["scopes"]["add.extraction"] == {
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "total_tokens": 15,
+        "calls": 1,
+    }
 
 
 @pytest.mark.asyncio
@@ -624,5 +856,3 @@ async def test_async_update_preserves_actor_id_when_different_actor_updates(mock
 
     stored = memory.vector_store.update.call_args.kwargs["payload"]
     assert stored["actor_id"] == "Alice"
-
-

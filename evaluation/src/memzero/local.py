@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from collections import defaultdict
 from copy import deepcopy
@@ -9,6 +10,12 @@ from datetime import datetime
 from pathlib import Path
 
 from jinja2 import Template
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_LOCAL_MEM0_INIT = _REPO_ROOT / "mem0" / "__init__.py"
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+import mem0
 from mem0.configs.prompts import get_update_memory_messages
 from mem0.memory.telemetry import capture_event
 from mem0.memory.utils import get_fact_retrieval_messages, parse_messages, process_telemetry_filters, remove_code_blocks
@@ -47,6 +54,21 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+if Path(mem0.__file__).resolve() != _LOCAL_MEM0_INIT.resolve():
+    raise ImportError(
+        "mem0_local benchmark must import the repo-local mem0 package. "
+        f"Expected {_LOCAL_MEM0_INIT}, got {mem0.__file__}."
+    )
+
+
+def _zero_usage_summary():
+    return {
+        "internal_llm_prompt_tokens": 0,
+        "internal_llm_completion_tokens": 0,
+        "internal_llm_total_tokens": 0,
+        "internal_llm_calls": 0,
+    }
+
 
 def _sanitize_openai_text(value):
     """Remove control characters that can break provider-side JSON parsing."""
@@ -66,31 +88,6 @@ def _sanitize_openai_messages(messages):
             }
         )
     return sanitized
-
-
-class LLMUsageTracker:
-    def __init__(self):
-        self.prompt_tokens = 0
-        self.completion_tokens = 0
-        self.total_tokens = 0
-        self.calls = 0
-
-    def callback(self, _llm, response, _params):
-        usage = getattr(response, "usage", None)
-        if usage is None:
-            return
-        self.prompt_tokens += int(getattr(usage, "prompt_tokens", 0) or 0)
-        self.completion_tokens += int(getattr(usage, "completion_tokens", 0) or 0)
-        self.total_tokens += int(getattr(usage, "total_tokens", 0) or 0)
-        self.calls += 1
-
-    def summary(self):
-        return {
-            "internal_llm_prompt_tokens": self.prompt_tokens,
-            "internal_llm_completion_tokens": self.completion_tokens,
-            "internal_llm_total_tokens": self.total_tokens,
-            "internal_llm_calls": self.calls,
-        }
 
 
 class SafeMemory(Memory):
@@ -278,29 +275,50 @@ class SafeMemory(Memory):
         return returned_memories
 
 
-def _speaker_usage_path(output_root, conversation_idx, speaker_label):
-    return Path(output_root) / str(conversation_idx) / speaker_label / "llm_usage.json"
+def _normalize_mem0_usage(usage_snapshot):
+    usage_snapshot = usage_snapshot or {}
+    return {
+        "internal_llm_prompt_tokens": int(usage_snapshot.get("prompt_tokens", 0) or 0),
+        "internal_llm_completion_tokens": int(usage_snapshot.get("completion_tokens", 0) or 0),
+        "internal_llm_total_tokens": int(usage_snapshot.get("total_tokens", 0) or 0),
+        "internal_llm_calls": int(usage_snapshot.get("calls", 0) or 0),
+        "scopes": usage_snapshot.get("scopes", {}) or {},
+    }
+
+
+def _conversation_usage_path(output_root, conversation_idx):
+    return Path(output_root) / str(conversation_idx) / "conversation_usage.json"
 
 
 def _speaker_store_path(output_root, conversation_idx, speaker_label):
     return Path(output_root) / str(conversation_idx) / speaker_label
 
 
-def _write_usage_summary(output_root, conversation_idx, speaker_label, usage_summary):
-    usage_path = _speaker_usage_path(output_root, conversation_idx, speaker_label)
+def _write_conversation_usage_summary(output_root, conversation_idx, speaker_usage):
+    usage_path = _conversation_usage_path(output_root, conversation_idx)
     usage_path.parent.mkdir(parents=True, exist_ok=True)
-    usage_path.write_text(json.dumps(usage_summary, indent=2), encoding="utf-8")
+    total_usage = _zero_usage_summary()
+    for usage in speaker_usage.values():
+        total_usage["internal_llm_prompt_tokens"] += int(usage.get("internal_llm_prompt_tokens", 0) or 0)
+        total_usage["internal_llm_completion_tokens"] += int(usage.get("internal_llm_completion_tokens", 0) or 0)
+        total_usage["internal_llm_total_tokens"] += int(usage.get("internal_llm_total_tokens", 0) or 0)
+        total_usage["internal_llm_calls"] += int(usage.get("internal_llm_calls", 0) or 0)
+    usage_path.write_text(
+        json.dumps(
+            {
+                **total_usage,
+                "speakers": speaker_usage,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
 
-def _read_usage_summary(output_root, conversation_idx, speaker_label):
-    usage_path = _speaker_usage_path(output_root, conversation_idx, speaker_label)
+def _read_conversation_usage_summary(output_root, conversation_idx):
+    usage_path = _conversation_usage_path(output_root, conversation_idx)
     if not usage_path.exists():
-        return {
-            "internal_llm_prompt_tokens": 0,
-            "internal_llm_completion_tokens": 0,
-            "internal_llm_total_tokens": 0,
-            "internal_llm_calls": 0,
-        }
+        return _zero_usage_summary()
     return json.loads(usage_path.read_text(encoding="utf-8"))
 
 
@@ -346,7 +364,6 @@ class MemoryLocalAdd:
         cfg = deepcopy(self._load_base_config())
         embedding = get_embedding_settings(self.runtime_config)
         mem0_cfg = self.runtime_config.get("mem0_local", {})
-        usage_tracker = LLMUsageTracker()
         speaker_root = self.output_root / str(conversation_idx) / speaker_label
         speaker_root.mkdir(parents=True, exist_ok=True)
         cfg["vector_store"]["provider"] = mem0_cfg.get("vector_store_provider", cfg["vector_store"]["provider"])
@@ -354,13 +371,11 @@ class MemoryLocalAdd:
         cfg["vector_store"]["config"]["collection_name"] = f"mem0_local_{conversation_idx}_{speaker_label}"
         cfg["llm"]["provider"] = mem0_cfg.get("llm_provider", cfg["llm"]["provider"])
         cfg["llm"]["config"]["model"] = mem0_cfg.get("llm_model", get_answer_model(self.runtime_config))
-        cfg["llm"]["config"]["response_callback"] = usage_tracker.callback
         cfg["embedder"]["provider"] = embedding["provider"]
         cfg["embedder"]["config"]["model"] = embedding["model"]
         cfg["embedder"]["config"]["embedding_dims"] = embedding["embedding_dims"]
         memory = SafeMemory.from_config(cfg)
         memory.reset()
-        memory._usage_tracker = usage_tracker
         return memory
 
     def _build_speaker_messages(self, chats, speaker_a, speaker_b):
@@ -411,8 +426,14 @@ class MemoryLocalAdd:
             memory_a.add(messages, user_id=speaker_a_user_id, metadata={"timestamp": timestamp})
             memory_b.add(messages_reverse, user_id=speaker_b_user_id, metadata={"timestamp": timestamp})
 
-        _write_usage_summary(self.output_root, idx, "speaker_a", memory_a._usage_tracker.summary())
-        _write_usage_summary(self.output_root, idx, "speaker_b", memory_b._usage_tracker.summary())
+        _write_conversation_usage_summary(
+            self.output_root,
+            idx,
+            {
+                "speaker_a": _normalize_mem0_usage(memory_a.get_llm_usage()),
+                "speaker_b": _normalize_mem0_usage(memory_b.get_llm_usage()),
+            },
+        )
 
     def process_all_conversations(self):
         if not self.data:
@@ -480,14 +501,12 @@ class MemoryLocalSearch:
     def _validate_conversation_runtime(self, conversation_idx):
         required_labels = ("speaker_a", "speaker_b")
         missing_paths = []
-        missing_usage = []
+        usage_path = _conversation_usage_path(self.output_root, conversation_idx)
         for label in required_labels:
             store_path = _speaker_store_path(self.output_root, conversation_idx, label)
-            usage_path = _speaker_usage_path(self.output_root, conversation_idx, label)
             if not store_path.exists():
                 missing_paths.append(store_path.as_posix())
-            if not usage_path.exists():
-                missing_usage.append(usage_path.as_posix())
+        missing_usage = [] if usage_path.exists() else [usage_path.as_posix()]
         if missing_paths or missing_usage:
             problems = []
             if missing_paths:
@@ -501,7 +520,7 @@ class MemoryLocalSearch:
 
     def search_memory(self, memory, user_id, query):
         start = time.time()
-        memories = memory.search(query, user_id=user_id, limit=self.top_k)
+        memories = memory.search(query, filters={"user_id": user_id}, top_k=self.top_k)
         end = time.time()
         results = memories.get("results", memories)
         semantic_memories = [
@@ -668,12 +687,11 @@ class MemoryLocalSearch:
             speaker_b_user_id = f"{speaker_b}_{idx}"
             memory_a = self._speaker_runtime(idx, "speaker_a")
             memory_b = self._speaker_runtime(idx, "speaker_b")
-            usage_a = _read_usage_summary(self.output_root, idx, "speaker_a")
-            usage_b = _read_usage_summary(self.output_root, idx, "speaker_b")
-            internal_prompt_tokens = usage_a["internal_llm_prompt_tokens"] + usage_b["internal_llm_prompt_tokens"]
-            internal_completion_tokens = usage_a["internal_llm_completion_tokens"] + usage_b["internal_llm_completion_tokens"]
-            internal_total_tokens = usage_a["internal_llm_total_tokens"] + usage_b["internal_llm_total_tokens"]
-            internal_calls = usage_a["internal_llm_calls"] + usage_b["internal_llm_calls"]
+            usage_summary = _read_conversation_usage_summary(self.output_root, idx)
+            internal_prompt_tokens = usage_summary["internal_llm_prompt_tokens"]
+            internal_completion_tokens = usage_summary["internal_llm_completion_tokens"]
+            internal_total_tokens = usage_summary["internal_llm_total_tokens"]
+            internal_calls = usage_summary["internal_llm_calls"]
             amortized_internal_total = internal_total_tokens / len(qa) if qa else 0.0
             amortized_internal_prompt = internal_prompt_tokens / len(qa) if qa else 0.0
             amortized_internal_completion = internal_completion_tokens / len(qa) if qa else 0.0
