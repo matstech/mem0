@@ -56,9 +56,6 @@ run-zep-search:
 run-openai:
 	python run_experiments.py --technique_type openai --output_folder results/
 
-run-dmf:
-	python run_experiments.py --technique_type dmf --output_folder results/
-
 # Comparison Summary
 # Usage: make compare NAME=my_run BASELINES="Label1,res1,met1 Label2,res2,met2" NOTES="Optional notes"
 NAME ?= comparison_$(shell date +%Y%m%d_%H%M%S)

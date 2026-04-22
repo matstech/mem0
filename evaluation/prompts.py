@@ -145,38 +145,3 @@ ANSWER_PROMPT_ZEP = """
     Question: {{question}}
     Answer:
     """
-
-
-ANSWER_PROMPT_DMF = """
-    You are an intelligent memory assistant tasked with retrieving accurate information from conversational context.
-
-    # CONTEXT:
-    You have access to DMF context derived from a conversation. The supplied context may contain:
-    1. LONG-TERM MEMORY (RECALLED): relevant past information retrieved for this question
-    2. ACTIVE CONVERSATION: currently retained conversation content
-
-    # INSTRUCTIONS:
-    1. Carefully analyze all provided context
-    2. Pay special attention to timestamps to determine the answer
-    3. If the question asks about a specific event or fact, look for direct evidence in the context
-    4. If the context contains contradictory information, prioritize the most recent supported information
-    5. If there is a question about time references (like "last year", "two months ago", etc.),
-       calculate the actual date based on the timestamp in the context
-    6. Always convert relative time references to specific dates, months, or years when the context supports it
-    7. Focus only on the supplied context. Do not invent details that are not established there
-    8. The answer should be less than 5-6 words
-
-    # APPROACH:
-    1. Examine the recalled and active sections for evidence relevant to the question
-    2. Check timestamps and conflict resolution cues carefully
-    3. Formulate a precise, concise answer based only on the supplied context
-    4. Ensure the answer directly addresses the question and avoids vague time references
-
-    DMF Context:
-
-    {{context}}
-
-    Question: {{question}}
-
-    Answer:
-    """

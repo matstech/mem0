@@ -9,6 +9,7 @@ from mem0.configs.llms.base import BaseLlmConfig
 from mem0.configs.llms.openai import OpenAIConfig
 from mem0.llms.base import LLMBase
 from mem0.memory.utils import extract_json
+from mem0.utils.openai_retry import call_with_rate_limit_retry
 
 
 class OpenAILLM(LLMBase):
@@ -137,7 +138,11 @@ class OpenAILLM(LLMBase):
         if tools:  # TODO: Remove tools if no issues found with new memory addition logic
             params["tools"] = tools
             params["tool_choice"] = tool_choice
-        response = self.client.chat.completions.create(**params)
+        response = call_with_rate_limit_retry(
+            self.client.chat.completions.create,
+            request_name="OpenAI chat completion",
+            **params,
+        )
         parsed_response = self._parse_response(response, tools)
         if self.config.response_callback:
             try:

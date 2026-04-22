@@ -6,10 +6,7 @@ from pathlib import Path
 from src.runtime_config import DEFAULT_RUNTIME_CONFIG_PATH, load_runtime_config
 from src.utils import METHODS, TECHNIQUES
 
-DEFAULT_DMF_REPO_PATH = "/Users/mat/workspace/personal/paper/agentic-summarization"
-DEFAULT_DMF_CONFIG_PATH = "config/dmf_benchmark_settings.toml"
 DEFAULT_MEM0_LOCAL_CONFIG_PATH = "config/mem0_local_config.json"
-DEFAULT_DMF_RUN_ROOT = "run/dmf"
 DEFAULT_MEM0_LOCAL_OUTPUT_ROOT = "run/mem0_local_v1"
 
 
@@ -20,12 +17,6 @@ class Experiment:
 
     def run(self):
         print(f"Running experiment with technique: {self.technique_type}, chunk size: {self.chunk_size}")
-
-
-def _default_dmf_run_root(locomo_rag_json_path, dmf_config_path):
-    dataset_stem = Path(locomo_rag_json_path).stem
-    config_stem = Path(dmf_config_path).stem
-    return str(Path(DEFAULT_DMF_RUN_ROOT) / dataset_stem / config_stem)
 
 
 def _default_mem0_local_output_root(locomo_json_path):
@@ -62,28 +53,10 @@ def main():
         help="Path to the shared runtime config for models and API keys",
     )
     parser.add_argument(
-        "--dmf_repo_path",
-        type=str,
-        default=DEFAULT_DMF_REPO_PATH,
-        help="Path to the DMF repository root",
-    )
-    parser.add_argument(
-        "--dmf_config_path",
-        type=str,
-        default=DEFAULT_DMF_CONFIG_PATH,
-        help="Path to the benchmark-specific DMF config",
-    )
-    parser.add_argument(
         "--max_conversations",
         type=int,
         default=None,
         help="Optional limit for the number of conversations to process",
-    )
-    parser.add_argument(
-        "--dmf_run_root",
-        type=str,
-        default=DEFAULT_DMF_RUN_ROOT,
-        help="Root directory for DMF benchmark runtime state",
     )
     parser.add_argument(
         "--mem0_local_config_path",
@@ -120,24 +93,11 @@ def main():
     if args.log_progress:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     runtime_config = load_runtime_config(args.runtime_config_path)
-    dmf_cfg = runtime_config.get("dmf", {})
     mem0_local_cfg = runtime_config.get("mem0_local", {})
-
-    dmf_repo_path = args.dmf_repo_path
-    if dmf_repo_path == DEFAULT_DMF_REPO_PATH:
-        dmf_repo_path = dmf_cfg.get("repo_path", dmf_repo_path)
-
-    dmf_config_path = args.dmf_config_path
-    if dmf_config_path == DEFAULT_DMF_CONFIG_PATH:
-        dmf_config_path = dmf_cfg.get("config_path", dmf_config_path)
 
     mem0_local_config_path = args.mem0_local_config_path
     if mem0_local_config_path == DEFAULT_MEM0_LOCAL_CONFIG_PATH:
         mem0_local_config_path = mem0_local_cfg.get("config_path", mem0_local_config_path)
-
-    dmf_run_root = args.dmf_run_root
-    if dmf_run_root == DEFAULT_DMF_RUN_ROOT:
-        dmf_run_root = _default_dmf_run_root(args.locomo_rag_json_path, dmf_config_path)
 
     mem0_local_output_root = args.mem0_local_output_root
     if mem0_local_output_root == DEFAULT_MEM0_LOCAL_OUTPUT_ROOT:
@@ -228,20 +188,6 @@ def main():
         output_file_path = os.path.join(args.output_folder, "openai_results.json")
         openai_manager = OpenAIPredict()
         openai_manager.process_data_file(args.locomo_json_path, output_file_path)
-    elif args.technique_type == "dmf":
-        from src.dmf_eval import DMFManager
-
-        output_file_path = os.path.join(args.output_folder, "dmf_results.json")
-        dmf_manager = DMFManager(
-            dataset_path=args.locomo_rag_json_path,
-            output_path=output_file_path,
-            dmf_repo_path=dmf_repo_path,
-            dmf_config_path=dmf_config_path,
-            run_root=dmf_run_root,
-            runtime_config=runtime_config,
-            max_conversations=args.max_conversations,
-        )
-        dmf_manager.process_all_conversations()
     else:
         raise ValueError(f"Invalid technique type: {args.technique_type}")
 
