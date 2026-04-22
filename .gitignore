@@ -188,7 +188,6 @@ qdrant_storage/
 testing.ipynb
 evaluation/models/*
 evaluation/run/*
-evaluation/dataset/*
 evaluation/results/*
 paperpdf
 *_internal.md
