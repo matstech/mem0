@@ -19,6 +19,7 @@ import mem0
 from mem0.configs.prompts import get_update_memory_messages
 from mem0.memory.telemetry import capture_event
 from mem0.memory.utils import get_fact_retrieval_messages, parse_messages, process_telemetry_filters, remove_code_blocks
+from mem0.utils.openai_retry import call_with_rate_limit_retry
 from openai import BadRequestError, OpenAI
 from prompts import ANSWER_PROMPT
 from tqdm import tqdm
@@ -117,9 +118,11 @@ class SafeMemory(Memory):
 
         sanitized_messages = _sanitize_openai_messages(messages)
         parsed_messages = parse_messages(sanitized_messages)
+        custom_fact_extraction_prompt = getattr(self.config, "custom_fact_extraction_prompt", None)
+        custom_update_memory_prompt = getattr(self.config, "custom_update_memory_prompt", None)
 
-        if self.config.custom_fact_extraction_prompt:
-            system_prompt = self.config.custom_fact_extraction_prompt
+        if custom_fact_extraction_prompt:
+            system_prompt = custom_fact_extraction_prompt
             user_prompt = f"Input:\n{parsed_messages}"
         else:
             system_prompt, user_prompt = get_fact_retrieval_messages(parsed_messages)
@@ -155,7 +158,7 @@ class SafeMemory(Memory):
             existing_memories = self.vector_store.search(
                 query=new_mem,
                 vectors=messages_embeddings,
-                limit=5,
+                top_k=5,
                 filters=filters,
             )
             for mem in existing_memories:
@@ -175,7 +178,7 @@ class SafeMemory(Memory):
 
         if new_retrieved_facts:
             function_calling_prompt = get_update_memory_messages(
-                retrieved_old_memory, new_retrieved_facts, self.config.custom_update_memory_prompt
+                retrieved_old_memory, new_retrieved_facts, custom_update_memory_prompt
             )
 
             try:
@@ -656,7 +659,9 @@ class MemoryLocalSearch:
             note="calling answer model",
         )
         start = time.time()
-        response = self.openai_client.chat.completions.create(
+        response = call_with_rate_limit_retry(
+            self.openai_client.chat.completions.create,
+            request_name="mem0_local search answer generation",
             model=get_answer_model(self.runtime_config),
             messages=[{"role": "system", "content": answer_prompt}],
             temperature=0.0,

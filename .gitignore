@@ -195,3 +195,4 @@ evaluation/run/*
 evaluation/dataset/*
 evaluation/results/*
 paperpdf
+*_internal.md

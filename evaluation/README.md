@@ -108,14 +108,14 @@ make run-openai           # Run OpenAI experiments
 Alternatively, you can run experiments directly with custom parameters:
 
 ```bash
-python run_experiments.py --technique_type [mem0|rag|langmem] [additional parameters]
+python run_experiments.py --technique_type [mem0|mem0_local|rag|langmem|zep|openai] [additional parameters]
 ```
 
 #### Command-line Parameters:
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `--technique_type` | Memory technique to use (mem0, rag, langmem) | mem0 |
+| `--technique_type` | Memory technique to use (mem0, mem0_local, rag, langmem, zep, openai) | mem0 |
 | `--method` | Method to use (add, search) | add |
 | `--chunk_size` | Chunk size for processing | 1000 |
 | `--top_k` | Number of top memories to retrieve | 30 |

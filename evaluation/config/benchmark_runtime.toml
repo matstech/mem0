@@ -1,0 +1,13 @@
+[api]
+openai_api_key = ""
+
+[models]
+answer_model = "gpt-4o-mini"
+embedding_provider = "huggingface"
+embedding_model = "BAAI/bge-small-en-v1.5"
+embedding_dimensions = 384
+
+[mem0_local]
+llm_provider = "openai"
+llm_model = "gpt-4o-mini"
+vector_store_provider = "chroma"

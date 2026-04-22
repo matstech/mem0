@@ -14,14 +14,14 @@ Il tool utilizza Python 3 e le seguenti librerie:
 
 ### Comando Base
 ```bash
-make compare BASELINES="DMF,path/to/dmf_results.json,path/to/dmf_metrics.json mem0,path/to/mem0_results.json"
+make compare BASELINES="mem0_local,path/to/mem0_local_results.json,path/to/mem0_local_metrics.json rag,path/to/rag_results.json,path/to/rag_metrics.json"
 ```
 
 ### Esempio con Tutte le Variabili
 ```bash
 make compare \
     NAME="subset2_analysis" \
-    BASELINES="DMF,results/subset2/dmf_results.json,results/subset2/dmf_eval_metrics.json mem0,results/subset2/mem0_local_results.json" \
+    BASELINES="mem0_local,results/subset2/mem0_local_results.json,results/subset2/mem0_local_metrics.json rag,results/subset2/rag_results.json,results/subset2/rag_metrics.json" \
     NOTES="Analisi comparativa su subset2"
 ```
 

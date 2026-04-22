@@ -22,7 +22,7 @@ python3 comparison_summary/run_comparison.py \
 
 ### Formato Argomento --baseline
 L'argomento `--baseline` accetta una stringa separata da virgole con i seguenti campi (in ordine):
-1. **Label**: Nome visualizzato nel report (es. `DMF_2048`).
+1. **Label**: Nome visualizzato nel report (es. `mem0_local`).
 2. **Results Path**: Percorso al file `*_results.json`.
 3. **Metrics Path** (Opzionale): Percorso al file `*_eval_metrics.json`.
 4. **Token Accounting Path** (Opzionale): Percorso al file `*_token_accounting_*.json`.
