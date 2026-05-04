@@ -56,6 +56,28 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*swigva
 logger = logging.getLogger(__name__)
 
 
+def _encode_linked_ids(ids) -> str:
+    """Serialize linked_memory_ids as a JSON string for ChromaDB-safe metadata."""
+    if isinstance(ids, set):
+        ids = sorted(ids)
+    return json.dumps(ids)
+
+
+def _decode_linked_ids(value) -> list:
+    """Deserialize linked_memory_ids from JSON string or passthrough list."""
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+            if isinstance(decoded, list):
+                return decoded
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return [value] if value else []
+    if isinstance(value, list):
+        return value
+    return []
+
+
 # Fields that hold runtime auth/connection objects and must be preserved.
 # These are non-serializable objects (e.g. AWSV4SignerAuth, RequestsHttpConnection)
 # needed by clients like OpenSearch — not sensitive strings to redact.
@@ -474,10 +496,10 @@ class Memory(MemoryBase):
                 # Update existing entity's linked_memory_ids
                 match = existing[0]
                 payload = match.payload or {}
-                linked_ids = payload.get("linked_memory_ids", [])
+                linked_ids = _decode_linked_ids(payload.get("linked_memory_ids", "[]"))
                 if memory_id not in linked_ids:
                     linked_ids.append(memory_id)
-                    payload["linked_memory_ids"] = linked_ids
+                    payload["linked_memory_ids"] = _encode_linked_ids(linked_ids)
                     self.entity_store.update(
                         vector_id=match.id,
                         vector=None,
@@ -489,7 +511,7 @@ class Memory(MemoryBase):
                 entity_payload = {
                     "data": entity_text,
                     "entity_type": entity_type,
-                    "linked_memory_ids": [memory_id],
+                    "linked_memory_ids": _encode_linked_ids([memory_id]),
                     **{k: v for k, v in search_filters.items()},
                 }
                 self.entity_store.insert(
@@ -522,8 +544,8 @@ class Memory(MemoryBase):
             for row in rows or []:
                 try:
                     payload = getattr(row, "payload", None) or {}
-                    linked = payload.get("linked_memory_ids", [])
-                    if not isinstance(linked, list) or memory_id not in linked:
+                    linked = _decode_linked_ids(payload.get("linked_memory_ids", "[]"))
+                    if memory_id not in linked:
                         continue
                     remaining = [mid for mid in linked if mid != memory_id]
                     if not remaining:
@@ -541,7 +563,7 @@ class Memory(MemoryBase):
                         except Exception as e:
                             logger.debug(f"Entity re-embed failed for '{entity_text}': {e}")
                             continue
-                        new_payload = {**payload, "linked_memory_ids": remaining}
+                        new_payload = {**payload, "linked_memory_ids": _encode_linked_ids(remaining)}
                         try:
                             self.entity_store.update(
                                 vector_id=row.id,
@@ -968,9 +990,9 @@ class Memory(MemoryBase):
                             # Update existing entity
                             match = matches[0]
                             payload = match.payload or {}
-                            linked = set(payload.get("linked_memory_ids", []))
+                            linked = set(_decode_linked_ids(payload.get("linked_memory_ids", "[]")))
                             linked |= memory_ids
-                            payload["linked_memory_ids"] = sorted(linked)
+                            payload["linked_memory_ids"] = _encode_linked_ids(sorted(linked))
                             try:
                                 self.entity_store.update(
                                     vector_id=match.id,
@@ -986,7 +1008,7 @@ class Memory(MemoryBase):
                             to_insert_payloads.append({
                                 "data": entity_text,
                                 "entity_type": entity_type,
-                                "linked_memory_ids": sorted(memory_ids),
+                                "linked_memory_ids": _encode_linked_ids(sorted(memory_ids)),
                                 **search_filters,
                             })
 
@@ -1529,8 +1551,8 @@ class Memory(MemoryBase):
                         continue
 
                     payload = match.payload if hasattr(match, 'payload') else {}
-                    linked_memory_ids = payload.get("linked_memory_ids", [])
-                    if not isinstance(linked_memory_ids, list):
+                    linked_memory_ids = _decode_linked_ids(payload.get("linked_memory_ids", "[]"))
+                    if not linked_memory_ids:
                         continue
 
                     # Spread-attenuated boost: entities linking to many memories get attenuated
@@ -1931,10 +1953,10 @@ class AsyncMemory(MemoryBase):
             if existing and existing[0].score >= 0.95:
                 match = existing[0]
                 payload = match.payload or {}
-                linked_ids = payload.get("linked_memory_ids", [])
+                linked_ids = _decode_linked_ids(payload.get("linked_memory_ids", "[]"))
                 if memory_id not in linked_ids:
                     linked_ids.append(memory_id)
-                    payload["linked_memory_ids"] = linked_ids
+                    payload["linked_memory_ids"] = _encode_linked_ids(linked_ids)
                     await asyncio.to_thread(
                         self.entity_store.update,
                         vector_id=match.id,
@@ -1946,7 +1968,7 @@ class AsyncMemory(MemoryBase):
                 entity_payload = {
                     "data": entity_text,
                     "entity_type": entity_type,
-                    "linked_memory_ids": [memory_id],
+                    "linked_memory_ids": _encode_linked_ids([memory_id]),
                     **{k: v for k, v in search_filters.items()},
                 }
                 await asyncio.to_thread(
@@ -1969,8 +1991,8 @@ class AsyncMemory(MemoryBase):
             for row in rows or []:
                 try:
                     payload = getattr(row, "payload", None) or {}
-                    linked = payload.get("linked_memory_ids", [])
-                    if not isinstance(linked, list) or memory_id not in linked:
+                    linked = _decode_linked_ids(payload.get("linked_memory_ids", "[]"))
+                    if memory_id not in linked:
                         continue
                     remaining = [mid for mid in linked if mid != memory_id]
                     if not remaining:
@@ -1988,7 +2010,7 @@ class AsyncMemory(MemoryBase):
                         except Exception as e:
                             logger.debug(f"Entity re-embed failed for '{entity_text}' (async): {e}")
                             continue
-                        new_payload = {**payload, "linked_memory_ids": remaining}
+                        new_payload = {**payload, "linked_memory_ids": _encode_linked_ids(remaining)}
                         try:
                             await asyncio.to_thread(
                                 self.entity_store.update,
@@ -2396,9 +2418,9 @@ class AsyncMemory(MemoryBase):
                         if matches and matches[0].score >= 0.95:
                             match = matches[0]
                             payload = match.payload or {}
-                            linked = set(payload.get("linked_memory_ids", []))
+                            linked = set(_decode_linked_ids(payload.get("linked_memory_ids", "[]")))
                             linked |= memory_ids
-                            payload["linked_memory_ids"] = sorted(linked)
+                            payload["linked_memory_ids"] = _encode_linked_ids(sorted(linked))
                             try:
                                 await asyncio.to_thread(
                                     self.entity_store.update,
@@ -2414,7 +2436,7 @@ class AsyncMemory(MemoryBase):
                             to_insert_payloads.append({
                                 "data": entity_text,
                                 "entity_type": entity_type,
-                                "linked_memory_ids": sorted(memory_ids),
+                                "linked_memory_ids": _encode_linked_ids(sorted(memory_ids)),
                                 **search_filters,
                             })
 
@@ -2952,8 +2974,8 @@ class AsyncMemory(MemoryBase):
                         continue
 
                     payload = match.payload if hasattr(match, 'payload') else {}
-                    linked_memory_ids = payload.get("linked_memory_ids", [])
-                    if not isinstance(linked_memory_ids, list):
+                    linked_memory_ids = _decode_linked_ids(payload.get("linked_memory_ids", "[]"))
+                    if not linked_memory_ids:
                         continue
 
                     num_linked = max(len(linked_memory_ids), 1)
